@@ -1,0 +1,2213 @@
+openapi: "3.0.3"
+info:
+  title: Unified Marketplace Gateway
+  description: |
+    Middleware berbasis Apache APISIX yang menyediakan satu API terpadu untuk
+    mengakses berbagai marketplace (Shopee dan TikTok).
+
+    **Fitur utama:**
+    - Autentikasi & HMAC-SHA256 signatures (Shopee & TikTok)
+    - Token Lifecycle — auto-refresh access token yang expired
+    - Parameter & response normalization
+    - **Auto detail enrichment** — setiap product list otomatis dilengkapi detail produk
+    - **RAW mode** — response dari marketplace TIDAK dimodifikasi, hanya dibungkus
+
+    **Base URL:** `http://localhost:9080`
+
+    **Environment:**
+    - Shopee Sandbox: `openplatform.sandbox.test-stable.shopee.sg`
+    - TikTok: `open-api.tiktokglobalshop.com`
+  version: "1.0.0"
+  contact:
+    name: Marketplace Gateway Team
+
+servers:
+  - url: http://localhost:9080
+    description: Local development server
+
+paths:
+  # ===========================================================================
+  # AUTH ENDPOINTS
+  # ===========================================================================
+
+  /auth/token:
+    post:
+      summary: Mendapatkan Access Token (Initial)
+      description: |
+        Menukarkan **authorization code (auth_code)** dari OAuth flow marketplace
+        dengan access token dan refresh token.
+
+        **Cara mendapatkan auth_code:**
+
+        **Shopee:**
+        ```
+        https://partner.shopeemobile.com/api/v2/shop/auth_partner?id={partner_id}&redirect={redirect_url}
+        ```
+
+        **TikTok:**
+        ```
+        https://partner.tiktokshop.com/page/oauth/authorize?app_key={app_key}&redirect_uri={redirect_url}&state={state}
+        ```
+      operationId: getToken
+      tags:
+        - Authentication
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - marketplace
+                - shop_uuid
+                - auth_code
+              properties:
+                marketplace:
+                  type: string
+                  enum: [shopee, tiktok]
+                  description: Marketplace target
+                  example: shopee
+                shop_uuid:
+                  type: string
+                  description: UUID shop yang terdaftar di credentials.json
+                  example: "227674818"
+                auth_code:
+                  type: string
+                  description: Authorization code dari OAuth flow marketplace
+                  example: "your_shopee_auth_code_here"
+      responses:
+        "200":
+          description: Token berhasil didapatkan
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  marketplace:
+                    type: string
+                    enum: [shopee, tiktok]
+                    example: shopee
+                  shop_uuid:
+                    type: string
+                    example: "227674818"
+                  data:
+                    type: object
+                    properties:
+                      access_token:
+                        type: string
+                        description: Access token untuk API calls
+                        example: "eyJhbGciOiJIUzI1NiJ9..."
+                      access_token_expires_at:
+                        type: integer
+                        description: Unix timestamp expiry access token
+                        example: 1700000000
+                      refresh_token:
+                        type: string
+                        description: Refresh token untuk memperbarui access token
+                        example: "eyJhbGciOiJIUzI1NiJ9..."
+                      refresh_token_expires_at:
+                        type: integer
+                        nullable: true
+                        description: Unix timestamp expiry refresh token
+                        example: 1730000000
+        "400":
+          description: Request tidak valid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                missingAuthCode:
+                  summary: Auth code tidak disertakan
+                  value:
+                    error:
+                      code: MISSING_AUTH_CODE
+                      message: "'auth_code' is required to obtain an access token. Get one from the marketplace OAuth flow."
+                      marketplace: shopee
+                marketplaceMismatch:
+                  summary: Marketplace tidak sesuai dengan shop
+                  value:
+                    error:
+                      code: MARKETPLACE_MISMATCH
+                      message: "shop '227674818' is a 'shopee' shop, not 'tiktok'"
+                      marketplace: tiktok
+        "401":
+          description: Re-autentikasi diperlukan
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: REAUTH_REQUIRED
+                  message: "failed to obtain access token: ..."
+                  marketplace: shopee
+
+  /auth/refresh:
+    post:
+      summary: Refresh Access Token
+      description: |
+        Memperbarui access token yang sudah expired.
+
+        **Opsional** — gateway akan auto-refresh secara otomatis saat product API call
+        dilakukan jika token expired. Endpoint ini untuk refresh manual.
+
+        Tidak perlu mengirim `auth_code`. Gateway menggunakan `refresh_token`
+        yang tersimpan di `credentials.json`.
+      operationId: refreshToken
+      tags:
+        - Authentication
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - marketplace
+                - shop_uuid
+              properties:
+                marketplace:
+                  type: string
+                  enum: [shopee, tiktok]
+                  description: Marketplace target
+                  example: shopee
+                shop_uuid:
+                  type: string
+                  description: UUID shop yang terdaftar di credentials.json
+                  example: "227674818"
+      responses:
+        "200":
+          description: Token berhasil direfresh
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  marketplace:
+                    type: string
+                    example: shopee
+                  shop_uuid:
+                    type: string
+                    example: "227674818"
+                  data:
+                    type: object
+                    properties:
+                      access_token:
+                        type: string
+                        example: "eyJhbGciOiJIUzI1NiJ9.CIG-SxABGMKVyGwgASjdxf7RBjDh4bL2CTgBQAE..."
+                      access_token_expires_at:
+                        type: integer
+                        example: 1782569757
+                      refresh_token:
+                        type: string
+                        example: "eyJhbGciOiJIUzI1NiJ9.CIG-SxABGMKVyGwgAijdxf7RBjDuqdz3CTgBQAE..."
+                      refresh_token_expires_at:
+                        type: integer
+                        nullable: true
+                        example: 1730000000
+        "400":
+          description: Refresh token tidak tersedia
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: NO_REFRESH_TOKEN
+                  message: "no refresh_token available — call /auth/token first to obtain tokens"
+                  marketplace: shopee
+        "401":
+          description: Refresh token expired
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: REFRESH_TOKEN_EXPIRED
+                  message: "refresh_token has expired — must re-authenticate via /auth/token"
+                  marketplace: shopee
+
+  /auth/status:
+    post:
+      summary: Cek Status Token
+      description: |
+        Memeriksa status token untuk suatu shop tanpa melakukan API call ke marketplace.
+        Berguna untuk mengecek apakah perlu refresh atau re-autentikasi sebelum
+        melakukan product API calls.
+      operationId: tokenStatus
+      tags:
+        - Authentication
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - marketplace
+                - shop_uuid
+              properties:
+                marketplace:
+                  type: string
+                  enum: [shopee, tiktok]
+                  example: shopee
+                shop_uuid:
+                  type: string
+                  example: "227674818"
+      responses:
+        "200":
+          description: Status token berhasil didapatkan
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  marketplace:
+                    type: string
+                    example: shopee
+                  shop_uuid:
+                    type: string
+                    example: "227674818"
+                  data:
+                    type: object
+                    properties:
+                      has_token:
+                        type: boolean
+                        description: Apakah shop memiliki access token
+                        example: true
+                      token_expired:
+                        type: boolean
+                        description: Apakah access token sudah expired
+                        example: false
+                      token_expires_at:
+                        type: integer
+                        nullable: true
+                        description: Unix timestamp expiry access token
+                        example: 1700000000
+                      refresh_expired:
+                        type: boolean
+                        description: Apakah refresh token sudah expired
+                        example: false
+                      refresh_expires_at:
+                        type: integer
+                        nullable: true
+                        description: Unix timestamp expiry refresh token
+                        example: 1730000000
+                      needs_refresh:
+                        type: boolean
+                        description: Apakah perlu refresh (token akan expired dalam 5 menit)
+                        example: false
+                      needs_reauth:
+                        type: boolean
+                        description: Apakah perlu re-autentikasi (token & refresh expired)
+                        example: false
+
+  # ===========================================================================
+  # PRODUCT ENDPOINTS
+  # ===========================================================================
+
+  /products:
+    get:
+      summary: Daftar Produk
+      description: |
+        Mendapatkan daftar produk dari marketplace.
+
+        **🔥 Auto Detail Enrichment:** Setiap produk dalam response otomatis
+        dilengkapi field `_detail` yang berisi response RAW dari endpoint
+        detail produk marketplace.
+
+        **Behavior per Marketplace:**
+        - **Shopee**: Batch fetch via `get_item_base_info` dengan `item_id_list`
+          (1 API call untuk semua produk).
+        - **TikTok**: Per-product fetch via `/product/202309/products/{id}`
+          (N API calls — signature berbeda setiap kali karena path berubah).
+
+        **Response Mode:**
+        - Response adalah **RAW** dari marketplace — TIDAK dinormalisasi.
+        - Produk hanya ditambahkan field `_detail` dengan raw detail response.
+      operationId: listProducts
+      tags:
+        - Products
+      parameters:
+        - name: marketplace
+          in: query
+          required: true
+          description: Marketplace target
+          schema:
+            type: string
+            enum: [shopee, tiktok, all]
+          examples:
+            shopee:
+              summary: Single marketplace (Shopee)
+              value: shopee
+            tiktok:
+              summary: Single marketplace (TikTok)
+              value: tiktok
+            all:
+              summary: Multi-marketplace fan-out
+              value: all
+
+        - name: shop_uuid
+          in: query
+          description: |
+            UUID shop (hanya untuk mode single-marketplace `shopee` atau `tiktok`).
+            **Tidak digunakan** untuk `marketplace=all`.
+          schema:
+            type: string
+          example: "227674818"
+
+        # ── Fan-out specific params ──
+        - name: shop_uuid_shopee
+          in: query
+          description: |
+            UUID Shopee shop (hanya untuk `marketplace=all`).
+            Diperlukan jika ingin query Shopee di fan-out mode.
+          schema:
+            type: string
+          example: "227674818"
+
+        - name: shop_uuid_tiktok
+          in: query
+          description: |
+            UUID TikTok shop (hanya untuk `marketplace=all`).
+            Diperlukan jika ingin query TikTok di fan-out mode.
+          schema:
+            type: string
+          example: "7494709429666874412"
+
+        # ── Pagination ──
+        - name: page
+          in: query
+          description: "Nomor halaman (min: 1, max: 10000)"
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+          example: 1
+
+        - name: page_size
+          in: query
+          description: "Jumlah item per halaman (min: 1, max: 200)"
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+          example: 50
+
+        - name: page_token
+          in: query
+          description: |
+            Cursor pagination (TikTok) — isi dengan `next_page_token` dari
+            response sebelumnya untuk mengambil halaman berikutnya.
+            (Alias: `next_page_token`.)
+          schema:
+            type: string
+          example: "WzE3ODQ4MDc1MTA1NjAsIjE3MzY2NzM4Njg1ODM1Njg0MjgiXQ=="
+
+        # ── Filter ──
+        - name: keyword
+          in: query
+          description: "Kata kunci pencarian produk (max: 200 karakter)"
+          schema:
+            type: string
+            maxLength: 200
+          example: "DIMMER"
+
+        - name: status
+          in: query
+          description: |
+            Filter status produk.
+
+            **Mapping:**
+            - `ACTIVE` → Shopee: `item_status=NORMAL` / TikTok: `status=ACTIVATE`
+            - `INACTIVE` → Shopee: `item_status=BANNED` / TikTok: `status=INACTIVATE`
+            - Jika tidak disertakan → default `NORMAL` (aktif)
+          schema:
+            type: string
+            enum: [ACTIVE, INACTIVE]
+          example: ACTIVE
+
+      responses:
+        "200":
+          description: |
+            Berhasil mendapatkan daftar produk.
+
+            **Format response tergantung marketplace:**
+            - `shopee` / `tiktok` → RAW response marketplace + `_detail` di setiap produk
+            - `all` → `{ marketplace: "all", responses: { shopee: {...}, tiktok: {...} } }`
+          content:
+            application/json:
+              examples:
+                shopeeResponse:
+                  summary: Shopee Products dengan _detail
+                  value:
+                    error: ""
+                    message: ""
+                    request_id: "e3e3e7f35539651adeee3fddc3900a00:020000cd9e64b421:01000247c238fdaf"
+                    response:
+                      total_count: 1
+                      has_next_page: false
+                      next: ""
+                      item:
+                        - item_id: 802023254
+                          item_status: "NORMAL"
+                          update_time: 1782366590
+                          tag:
+                            kit: false
+                          _detail:
+                            item_id: 802023254
+                            item_name: "Logo Mirorim"
+                            item_sku: ""
+                            category_id: 300168
+                            create_time: 1782366590
+                            update_time: 1782366590
+                            image:
+                              image_url_list:
+                                - "https://cf.shopee.co.id/file/id-11134207-81z1k-mpvu3bnxlvk1b4"
+                              image_id_list:
+                                - "id-11134207-81z1k-mpvu3bnxlvk1b4"
+                              image_ratio: "1:1"
+                            weight: "0.01"
+                            condition: "NEW"
+                            has_model: true
+                            item_status: "NORMAL"
+                            description_info:
+                              extended_description:
+                                field_list:
+                                  - field_type: text
+                                    text: "Logo Mirorim Logo Mirorim ..."
+                            logistic_info:
+                              - logistic_id: 81016
+                                logistic_name: "Sandbox-J&T Cargo(Don't modify)"
+                                enabled: true
+                                estimated_shipping_fee: 11765
+                            attribute_list:
+                              - attribute_id: 200121
+                                original_attribute_name: "[S]Warranty Duration"
+                                attribute_value_list:
+                                  - value_id: 105577
+                                    original_value_name: "[S]No Warranty"
+                            pre_order:
+                              is_pre_order: false
+                              days_to_ship: 2
+
+                tiktokResponse:
+                  summary: TikTok Products dengan _detail
+                  value:
+                    code: 0
+                    message: Success
+                    request_id: "20260627160120FEE188FC06056035798F"
+                    data:
+                      total_count: 2
+                      next_page_token: "WzE3ODExNzE1NzQ4MzEsIjE3MzYwMzMzOTA5NDE3MzM5MzIiXQ=="
+                      products:
+                        - id: "1736033390941733932"
+                          title: "AC DIMMER TESTING APLIKASI!!!!!!!!!!!!!!"
+                          status: "ACTIVATE"
+                          create_time: 1781171064
+                          update_time: 1781171574
+                          skus:
+                            - id: "1736032926678615084"
+                              seller_sku: "1A1"
+                              price:
+                                currency: "IDR"
+                                tax_exclusive_price: "9000"
+                                sale_price: "9000"
+                              inventory:
+                                - quantity: 100
+                                  warehouse_id: "7650040435037325077"
+                              status_info:
+                                status: "NORMAL"
+                          _detail:
+                            code: 0
+                            message: Success
+                            data:
+                              id: "1736033390941733932"
+                              title: "AC DIMMER TESTING APLIKASI!!!!!!!!!!!!!!"
+                              status: "ACTIVATE"
+                              product_status: "ACTIVATE"
+                              description: "<p>Produk ini merupakan solusi terintegrasi...</p>"
+                              create_time: 1781171064
+                              update_time: 1781171574
+                              skus:
+                                - id: "1736032926678615084"
+                                  seller_sku: "1A1"
+                                  price:
+                                    currency: "IDR"
+                                    tax_exclusive_price: "9000"
+                                    sale_price: "9000"
+                                  inventory:
+                                    - quantity: 100
+                                      warehouse_id: "7650040435037325077"
+                                  status_info:
+                                    status: "NORMAL"
+                              main_images:
+                                - url:
+                                    - "https://p16-oec-sg.ibyteimg.com/tos-alisg-i-aphluv4xwc-sg/..."
+                                  uri: "tos-alisg-i-aphluv4xwc-sg/..."
+                              category_chains:
+                                - id: "605196"
+                                  local_name: "Mobil & Sepeda Motor"
+                                  parent_id: "0"
+                                - id: "929928"
+                                  local_name: "Elektronik Mobil"
+                                  parent_id: "605196"
+                                - id: "931208"
+                                  local_name: "Peralatan Elektrik untuk Mobil"
+                                  parent_id: "929928"
+                              product_attributes:
+                                - id: "100107"
+                                  name: "Jenis Garansi"
+                                  values:
+                                    - id: "1000054"
+                                      name: "Garansi Produsen"
+                              package_weight:
+                                unit: "KILOGRAM"
+                                value: "0.01"
+                              package_dimensions:
+                                length: "10"
+                                width: "10"
+                                height: "10"
+                                unit: "CENTIMETER"
+                              is_cod_allowed: true
+                              is_pre_owned: false
+                              has_draft: true
+
+                fanoutResponse:
+                  summary: Fan-out All Marketplaces
+                  value:
+                    marketplace: all
+                    responses:
+                      shopee:
+                        error: ""
+                        message: ""
+                        response:
+                          total_count: 1
+                          item:
+                            - item_id: 802023254
+                              item_status: "NORMAL"
+                              _detail:
+                                item_id: 802023254
+                                item_name: "Logo Mirorim"
+                                image:
+                                  image_url_list:
+                                    - "https://cf.shopee.co.id/file/id-11134207-81z1k-mpvu3bnxlvk1b4"
+                      tiktok:
+                        code: 0
+                        message: Success
+                        data:
+                          total_count: 2
+                          products:
+                            - id: "1736033390941733932"
+                              title: "AC DIMMER TESTING APLIKASI!!!!!!!!!!!!!!"
+                              status: "ACTIVATE"
+                              _detail:
+                                code: 0
+                                data:
+                                  id: "1736033390941733932"
+                                  title: "AC DIMMER TESTING APLIKASI!!!!!!!!!!!!!!"
+                                  skus:
+                                    - id: "1736032926678615084"
+                                      seller_sku: "1A1"
+                                      price:
+                                        currency: "IDR"
+                                        tax_exclusive_price: "9000"
+
+        "400":
+          description: Parameter tidak valid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                missingMarketplace:
+                  summary: Marketplace tidak disertakan
+                  value:
+                    error:
+                      code: MISSING_MARKETPLACE
+                      message: "query parameter 'marketplace' is required (shopee, tiktok, or all)"
+                unsupportedMarketplace:
+                  summary: Marketplace tidak didukung
+                  value:
+                    error:
+                      code: UNSUPPORTED_MARKETPLACE
+                      message: "unsupported marketplace 'lazada'. Supported: shopee, tiktok, all"
+                      supported_marketplaces: [shopee, tiktok, all]
+                missingFanoutParams:
+                  summary: Fan-out tanpa shop UUID
+                  value:
+                    error:
+                      code: MISSING_PARAMS
+                      message: "fan-out mode requires at least one of: shop_uuid_shopee or shop_uuid_tiktok"
+                marketplaceMismatch:
+                  summary: Shop UUID tidak sesuai marketplace
+                  value:
+                    error:
+                      code: MARKETPLACE_MISMATCH
+                      message: "shop '227674818' is a 'shopee' shop, not 'tiktok'"
+                endpointNotSupported:
+                  summary: Endpoint tidak didukung marketplace
+                  value:
+                    error:
+                      code: ENDPOINT_NOT_SUPPORTED
+                      message: "endpoint 'products' not supported for marketplace 'tiktok'"
+        "403":
+          description: Shop tidak aktif
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: SHOP_INACTIVE
+                  message: "shopee shop '227674818' is not active"
+                  marketplace: shopee
+        "404":
+          description: Shop tidak ditemukan
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: SHOP_NOT_FOUND
+                  message: "shopee shop 'nonexistent' not found"
+        "500":
+          description: Internal gateway error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: UPSTREAM_ERROR
+                  message: null
+                  marketplace: shopee
+                  original_status: 500
+                  original_code: "product.error_unknown"
+                  request_id: "c0146e90-8e63-4efa-abac-8e875f7d3974"
+        "502":
+          description: Semua marketplace gagal di fan-out
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: FANOUT_ERROR
+                  message: "failed to fetch products from any marketplace"
+
+  # ── POST /products — Inventory Search (TikTok Only) ───────────────────
+  # Auto-detected: if request body contains product_ids or sku_ids,
+  # gateway routes to TikTok Inventory Search API.
+  # Body: { product_ids: [...], sku_ids: [...] }
+    post:
+      summary: Cari Inventory Produk/SKU (TikTok Only, auto-detected)
+      description: |
+        Mencari informasi inventory untuk produk atau SKU tertentu di TikTok Shop.
+        Endpoint ini adalah `/products` yang sama — gateway auto-detect dari body request.
+
+        **Fitur:**
+        - Kirim `product_ids` atau `sku_ids` di body → otomatis jadi Inventory Search
+        - Kirim body biasa (status, keyword) → Product Search seperti biasa
+        - Jika kedua parameter dikirim, `sku_ids` akan diprioritaskan
+        - Mengembalikan detail stok per-warehouse
+        - Distribusi inventory (campaign, creator, in-shop)
+
+        **Required Scope:** `seller.product.basic`
+
+        **TikTok Endpoint:** `POST /product/202309/inventory/search`
+      operationId: inventorySearch
+      tags:
+        - Products
+        - Inventory
+      parameters:
+        - name: marketplace
+          in: query
+          required: true
+          description: Marketplace target (hanya tiktok)
+          schema:
+            type: string
+            enum: [tiktok]
+          example: tiktok
+
+        - name: shop_uuid
+          in: query
+          required: true
+          description: UUID shop TikTok yang terdaftar di credentials.json
+          schema:
+            type: string
+          example: "7494709429666874412"
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                product_ids:
+                  type: array
+                  description: Daftar product IDs (max 100)
+                  items:
+                    type: string
+                  example: ["1729592969712207008"]
+                sku_ids:
+                  type: array
+                  description: Daftar SKU IDs (max 600). Diprioritaskan jika dikirim bersama product_ids
+                  items:
+                    type: string
+                  example: ["1729388324987897824"]
+
+      responses:
+        "200":
+          description: |
+            Informasi inventory berhasil didapatkan.
+
+            Response dibungkus dalam format:
+            ```json
+            {
+              "marketplace": "tiktok",
+              "raw_response": { ... RAW dari TikTok Inventory Search API ... }
+            }
+            ```
+          content:
+            application/json:
+              example:
+                marketplace: tiktok
+                raw_response:
+                  code: 0
+                  data:
+                    inventory:
+                      - product_id: "1729592969712207008"
+                        skus:
+                          - id: "1729388324987897824"
+                            seller_sku: "Color-Red-XM01"
+                            total_available_quantity: 100
+                            total_committed_quantity: 10
+                            warehouse_inventory:
+                              - warehouse_id: "7054915283043174149"
+                                available_quantity: 100
+                                committed_quantity: 10
+                            total_available_inventory_distribution:
+                              campaign_inventory:
+                                - quantity: 30
+                                  campaign_name: "Big Sale"
+                              creator_inventory:
+                                - quantity: 20
+                                  creator_name: "py001"
+                              in_shop_inventory:
+                                quantity: 50
+                  message: "Success"
+                  request_id: "202203070749000101890810281E8C70B7"
+        "400":
+          description: Parameter tidak valid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                missingBody:
+                  summary: Body tidak disertakan
+                  value:
+                    error:
+                      code: MISSING_BODY
+                      message: "request body is required"
+                invalidJson:
+                  summary: Format JSON salah
+                  value:
+                    error:
+                      code: INVALID_JSON
+                      message: "invalid JSON in request body"
+                unsupportedMarketplace:
+                  summary: Marketplace tidak didukung
+                  value:
+                    error:
+                      code: ENDPOINT_NOT_SUPPORTED
+                      message: "endpoint 'inventory_search' not supported for marketplace 'shopee'"
+        "500":
+          description: Error dari TikTok upstream
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: UPSTREAM_ERROR
+                  message: "upstream request failed"
+                  marketplace: tiktok
+                  original_status: 500
+                  original_code: "36009003"
+                  request_id: "8cd88fda-3d14-4859-ba2f-85ea867332af"
+
+  /products/create:
+    post:
+      summary: Buat Produk Baru
+      description: |
+        Membuat produk baru di marketplace.
+
+        **Endpoint Dinamis:** Bekerja untuk Shopee maupun TikTok — gateway secara otomatis
+        menerjemahkan request body terunifikasi ke format spesifik masing-masing marketplace.
+
+        **Shopee:** `POST /api/v2/product/add_item`
+        **TikTok:** `POST /product/202309/products`
+
+        **Required Scope:**
+        - TikTok: `seller.product.write`
+        - Shopee: Akses ke Shopee Product API
+      operationId: createProduct
+      tags:
+        - Products
+      parameters:
+        - name: marketplace
+          in: query
+          required: true
+          description: Marketplace target
+          schema:
+            type: string
+            enum: [shopee, tiktok]
+          example: shopee
+
+        - name: shop_uuid
+          in: query
+          required: true
+          description: UUID shop yang terdaftar di credentials.json
+          schema:
+            type: string
+          example: "227674818"
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - title
+                - category_id
+                - skus
+              properties:
+                title:
+                  type: string
+                  description: Nama produk
+                  example: "Kemeja Flanel Pria Lengan Panjang"
+                description:
+                  type: string
+                  description: Deskripsi produk dalam format HTML (TikTok) atau teks biasa (Shopee)
+                  example: "<p>Kemeja flanel berkualitas tinggi, bahan nyaman dipakai sehari-hari.</p>"
+                category_id:
+                  type: string
+                  description: ID kategori produk
+                  example: "600001"
+                brand_id:
+                  type: string
+                  description: ID brand (opsional)
+                  example: "7082427311584347905"
+                save_mode:
+                  type: string
+                  description: |
+                    Mode penyimpanan produk.
+                    - `LISTING` (default): Langsung publish
+                    - `AS_DRAFT`: Simpan sebagai draft
+                  enum: [LISTING, AS_DRAFT]
+                  default: LISTING
+                  example: LISTING
+                main_images:
+                  type: array
+                  description: "Daftar gambar utama produk (TikTok: URI dari Upload API, Shopee: image_id_list)"
+                  items:
+                    type: object
+                    properties:
+                      uri:
+                        type: string
+                        description: URI gambar dari marketplace Upload API
+                        example: "tos-maliva-i-o3syd03w52-us/c668cdf70b7f483c94dbe"
+                  example:
+                    - uri: "tos-maliva-i-o3syd03w52-us/c668cdf70b7f483c94dbe"
+                skus:
+                  type: array
+                  description: Daftar SKU/variasi produk (min 1)
+                  items:
+                    type: object
+                    properties:
+                      seller_sku:
+                        type: string
+                        description: Kode SKU internal penjual
+                        example: "FLANEL-RED-XL"
+                      price:
+                        type: object
+                        properties:
+                          amount:
+                            type: string
+                            description: Harga jual
+                            example: "150000"
+                          currency:
+                            type: string
+                            description: Mata uang (IDR, USD, dll)
+                            example: "IDR"
+                      inventory:
+                        type: array
+                        description: Informasi stok per gudang
+                        items:
+                          type: object
+                          properties:
+                            warehouse_id:
+                              type: string
+                              description: ID gudang
+                              example: "7068517275539719942"
+                            quantity:
+                              type: integer
+                              description: Jumlah stok
+                              example: 100
+                      sales_attributes:
+                        type: array
+                        description: Atribut variasi (warna, ukuran, dll)
+                        items:
+                          type: object
+                          properties:
+                            name:
+                              type: string
+                              description: Nama atribut (Color, Size, dll)
+                              example: "Color"
+                            value_name:
+                              type: string
+                              description: Nilai atribut (Red, XL, dll)
+                              example: "Red"
+                  example:
+                    - seller_sku: "FLANEL-RED-XL"
+                      price:
+                        amount: "150000"
+                        currency: "IDR"
+                      inventory:
+                        - warehouse_id: "7068517275539719942"
+                          quantity: 100
+                      sales_attributes:
+                        - name: "Color"
+                          value_name: "Red"
+                        - name: "Size"
+                          value_name: "XL"
+                package_weight:
+                  type: object
+                  description: Berat paket
+                  properties:
+                    value:
+                      type: string
+                      example: "1.5"
+                    unit:
+                      type: string
+                      enum: [KILOGRAM, GRAM, POUND]
+                      example: "KILOGRAM"
+                package_dimensions:
+                  type: object
+                  description: Dimensi paket
+                  properties:
+                    length:
+                      type: string
+                      example: "10"
+                    width:
+                      type: string
+                      example: "10"
+                    height:
+                      type: string
+                      example: "10"
+                    unit:
+                      type: string
+                      enum: [CENTIMETER, INCH]
+                      example: "CENTIMETER"
+                is_cod_allowed:
+                  type: boolean
+                  description: Mengizinkan pembayaran COD
+                  example: true
+                external_product_id:
+                  type: string
+                  description: ID produk dari platform eksternal
+                  example: "EXT-PROD-001"
+                product_attributes:
+                  type: array
+                  description: Atribut produk tambahan
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                        example: "100392"
+                      values:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id:
+                              type: string
+                              example: "1001533"
+                            name:
+                              type: string
+                              example: "Birthday"
+                shipping_template_id:
+                  type: string
+                  description: ID template pengiriman
+                  example: "7552764259994699538"
+                idempotency_key:
+                  type: string
+                  description: Key unik untuk mencegah duplikasi (recommended untuk TikTok)
+                  maxLength: 128
+                  example: "create202208291503530001100220033"
+
+      responses:
+        "200":
+          description: |
+            Produk berhasil dibuat.
+
+            Response terunifikasi:
+            ```json
+            {
+              "marketplace": "shopee|tiktok",
+              "action": "create_product",
+              "success": true,
+              "data": {
+                "product_id": "123456",
+                "skus": [{ "id": "...", "seller_sku": "..." }],
+                "raw_response": { ... RAW dari marketplace ... }
+              }
+            }
+            ```
+          content:
+            application/json:
+              examples:
+                shopeeCreateResponse:
+                  summary: Shopee Create Product Success
+                  value:
+                    marketplace: shopee
+                    action: create_product
+                    success: true
+                    data:
+                      product_id: "123456789"
+                      warning: ""
+                      raw_response:
+                        item_id: 123456789
+                        warning: ""
+
+                tiktokCreateResponse:
+                  summary: TikTok Create Product Success
+                  value:
+                    marketplace: tiktok
+                    action: create_product
+                    success: true
+                    data:
+                      product_id: "1736033390941733932"
+                      skus:
+                        - id: "1736032926678615084"
+                          seller_sku: "FLANEL-RED-XL"
+                      raw_response:
+                        product_id: "1736033390941733932"
+                        skus:
+                          - id: "1736032926678615084"
+                            seller_sku: "FLANEL-RED-XL"
+
+        "400":
+          description: Parameter tidak valid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                missingBody:
+                  summary: Body tidak disertakan
+                  value:
+                    error:
+                      code: MISSING_BODY
+                      message: "request body is required"
+                missingTitle:
+                  summary: Title tidak disertakan
+                  value:
+                    error:
+                      code: INVALID_PARAMETER
+                      message: "title is required"
+                missingCategory:
+                  summary: Category ID tidak disertakan
+                  value:
+                    error:
+                      code: INVALID_PARAMETER
+                      message: "category_id is required"
+                missingSkus:
+                  summary: SKU tidak disertakan
+                  value:
+                    error:
+                      code: INVALID_PARAMETER
+                      message: "at least one sku is required"
+                invalidJson:
+                  summary: Format JSON salah
+                  value:
+                    error:
+                      code: INVALID_JSON
+                      message: "invalid JSON in request body"
+                endpointNotSupported:
+                  summary: Marketplace tidak mendukung
+                  value:
+                    error:
+                      code: ENDPOINT_NOT_SUPPORTED
+                      message: "endpoint 'create_product' not supported for marketplace 'shopee'"
+        "401":
+          description: Autentikasi gagal
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: UNAUTHORIZED
+                  message: "invalid access token"
+                  marketplace: shopee
+                  original_status: 401
+                  original_code: "error_auth"
+                  request_id: "8cd88fda-3d14-4859-ba2f-85ea867332af"
+        "500":
+          description: Error dari marketplace upstream
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: UPSTREAM_ERROR
+                  message: "some product attributes are missing"
+                  marketplace: tiktok
+                  original_status: 200
+                  original_code: "10001"
+                  request_id: "3f51e14b-e62f-464f-b48d-ed470017eaae"
+
+  # ===========================================================================
+  # UPDATE STATUS ENDPOINT
+  # ===========================================================================
+
+  /update-status/{product_id}:
+    post:
+      summary: Update Status Produk
+      description: |
+        Mengubah status (ACTIVE/INACTIVE) produk di marketplace.
+
+        **Shopee:** Menggunakan endpoint `POST /api/v2/product/update_item` dengan
+        parameter `item_id` dan `item_status` (NORMAL/UNLIST).
+
+        **TikTok:**
+        - ACTIVE → `POST /product/202309/products/activate`
+        - INACTIVE → `POST /product/202309/products/deactivate`
+        - Mendukung **batch update** (max 20 product_ids via body)
+
+        **Catatan:**
+        - `marketplace=all` tidak didukung (mutasi per-shop).
+        - TikTok DRAFT product tidak bisa langsung di-activate (perlu setup lengkap).
+        - Shopee deactivate (UNLIST) sudah terverifikasi berfungsi.
+
+        **Tested:**
+        - ✅ Shopee DEACTIVATE: 802023254 (NORMAL → UNLIST)
+        - ✅ TikTok DEACTIVATE: endpoint routing berfungsi
+        - ⚠️ TikTok ACTIVATE DRAFT: butuh setup tambahan sebelum aktivasi
+      operationId: updateStatus
+      tags:
+        - Products
+      parameters:
+        - name: product_id
+          in: path
+          required: false
+          description: ID produk di marketplace (optional jika pakai product_ids di body)
+          schema:
+            type: string
+          example: "802023254"
+
+        - name: marketplace
+          in: query
+          required: true
+          description: Marketplace target
+          schema:
+            type: string
+            enum: [shopee, tiktok]
+          example: shopee
+
+        - name: shop_uuid
+          in: query
+          required: true
+          description: UUID shop yang terdaftar di credentials.json
+          schema:
+            type: string
+          example: "227674818"
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - status
+              properties:
+                status:
+                  type: string
+                  enum: [ACTIVE, INACTIVE]
+                  description: Target status
+                  example: ACTIVE
+                product_ids:
+                  type: array
+                  description: Batch product IDs (TikTok, max 20). Optional — fallback ke product_id dari path.
+                  items:
+                    type: string
+                  example: ["1736673915168916524", "1736674150837486636"]
+                listing_platforms:
+                  type: array
+                  description: Platform listing (TikTok only, untuk seller migrasi dari Tokopedia)
+                  items:
+                    type: string
+                    enum: [TIKTOK_SHOP, TOKOPEDIA]
+                  example: ["TIKTOK_SHOP"]
+
+      responses:
+        "200":
+          description: Status berhasil diupdate
+          content:
+            application/json:
+              examples:
+                shopeeDeactivate:
+                  summary: Shopee Deactivate Success
+                  value:
+                    marketplace: shopee
+                    action: update_status
+                    status: INACTIVE
+                    raw_response:
+                      error: ""
+                      message: ""
+                      request_id: "e3e3e7f357cdb60a43f217b4bfb87d00"
+                      response:
+                        item_id: 802023254
+                        item_status: UNLIST
+                        item_name: "Logo Mirorim"
+
+                tiktokActivate:
+                  summary: TikTok Activate Response (dengan errors jika ada partial failure)
+                  value:
+                    marketplace: tiktok
+                    action: update_status
+                    status: ACTIVE
+                    raw_response:
+                      code: 0
+                      message: Success
+                      request_id: "20260730135458C9929331D99EBF0701B4"
+                      data:
+                        errors:
+                          - code: 12052990
+                            message: "Batch activate business error."
+                            detail:
+                              product_id: "1736784139476829228"
+                              extra_errors:
+                                - code: 12052901
+                                  message: "product status invalid"
+
+        "400":
+          description: Parameter tidak valid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                missingStatus:
+                  summary: Status tidak disertakan
+                  value:
+                    error:
+                      code: MISSING_STATUS
+                      message: "'status' is required: must be ACTIVE or INACTIVE"
+                invalidStatus:
+                  summary: Status tidak valid
+                  value:
+                    error:
+                      code: INVALID_STATUS
+                      message: "'status' must be ACTIVE or INACTIVE (got: INVALID_VALUE)"
+                tooManyProductIds:
+                  summary: Terlalu banyak produk
+                  value:
+                    error:
+                      code: TOO_MANY_PRODUCT_IDS
+                      message: "product_ids must not exceed 20 items"
+                invalidField:
+                  summary: Field di luar whitelist
+                  value:
+                    error:
+                      code: INVALID_FIELD
+                      message: "field not allowed for this endpoint: sku"
+                      disallowed_fields: ["sku"]
+
+  /products/{product_id}:
+    get:
+      summary: Detail Produk
+      description: |
+        Mendapatkan detail lengkap dari satu produk berdasarkan ID.
+
+        **Response adalah RAW dari marketplace** — TIDAK dimodifikasi, TIDAK dinormalisasi.
+        Response hanya dibungkus dengan field `marketplace` dan `raw_response`.
+
+        **Shopee:** Menggunakan endpoint `get_item_base_info` dengan parameter `item_id_list`.
+        **TikTok:** Menggunakan endpoint `/product/202309/products/{product_id}`.
+      operationId: getProductDetail
+      tags:
+        - Products
+      parameters:
+        - name: product_id
+          in: path
+          required: true
+          description: ID produk di marketplace
+          schema:
+            type: string
+          examples:
+            shopeeProduct:
+              summary: Shopee product ID
+              value: "802023254"
+            tiktokProduct:
+              summary: TikTok product ID
+              value: "1736033390941733932"
+
+        - name: marketplace
+          in: query
+          required: true
+          description: Marketplace target
+          schema:
+            type: string
+            enum: [shopee, tiktok]
+          example: shopee
+
+        - name: shop_uuid
+          in: query
+          required: true
+          description: UUID shop yang terdaftar di credentials.json
+          schema:
+            type: string
+          example: "227674818"
+
+      responses:
+        "200":
+          description: |
+            Detail produk berhasil didapatkan.
+
+            Response dibungkus dalam format:
+            ```json
+            {
+              "marketplace": "shopee|tiktok",
+              "raw_response": { ... RAW dari marketplace ... }
+            }
+            ```
+          content:
+            application/json:
+              examples:
+                shopeeDetailResponse:
+                  summary: Shopee Product Detail (RAW)
+                  value:
+                    marketplace: shopee
+                    raw_response:
+                      error: ""
+                      message: ""
+                      warning: ""
+                      request_id: "e3e3e7f355393816334c68aa99067300"
+                      response:
+                        item_list:
+                          - item_id: 802023254
+                            category_id: 300168
+                            item_name: "Logo Mirorim"
+                            item_sku: ""
+                            create_time: 1782366590
+                            update_time: 1782366590
+                            image:
+                              image_url_list:
+                                - "https://cf.shopee.co.id/file/id-11134207-81z1k-mpvu3bnxlvk1b4"
+                              image_id_list:
+                                - "id-11134207-81z1k-mpvu3bnxlvk1b4"
+                              image_ratio: "1:1"
+                            weight: "0.01"
+                            condition: "NEW"
+                            item_status: "NORMAL"
+                            has_model: true
+                            description_info:
+                              extended_description:
+                                field_list:
+                                  - field_type: text
+                                    text: "Logo Mirorim Logo Mirorim ..."
+                            logistic_info:
+                              - logistic_id: 81016
+                                logistic_name: "Sandbox-J&T Cargo(Don't modify)"
+                                enabled: true
+                                estimated_shipping_fee: 11765
+                            attribute_list:
+                              - attribute_id: 200121
+                                original_attribute_name: "[S]Warranty Duration"
+                                attribute_value_list:
+                                  - original_value_name: "[S]No Warranty"
+                            pre_order:
+                              is_pre_order: false
+                              days_to_ship: 2
+                            brand:
+                              brand_id: 0
+                              original_brand_name: "NoBrand"
+
+                tiktokDetailResponse:
+                  summary: TikTok Product Detail (RAW)
+                  value:
+                    marketplace: tiktok
+                    raw_response:
+                      code: 0
+                      message: Success
+                      request_id: "202606271605497255036A0D6087354986"
+                      data:
+                        id: "1736033390941733932"
+                        title: "AC DIMMER TESTING APLIKASI!!!!!!!!!!!!!!"
+                        status: "ACTIVATE"
+                        product_status: "ACTIVATE"
+                        description: "<p>Produk ini merupakan solusi terintegrasi...</p>"
+                        create_time: 1781171064
+                        update_time: 1781171574
+                        skus:
+                          - id: "1736032926678615084"
+                            seller_sku: "1A1"
+                            price:
+                              currency: "IDR"
+                              tax_exclusive_price: "9000"
+                              sale_price: "9000"
+                            inventory:
+                              - quantity: 100
+                                warehouse_id: "7650040435037325077"
+                            status_info:
+                              status: "NORMAL"
+                        main_images:
+                          - url:
+                              - "https://p16-oec-sg.ibyteimg.com/tos-alisg-i-aphluv4xwc-sg/..."
+                            uri: "tos-alisg-i-aphluv4xwc-sg/..."
+                            height: 673
+                            width: 673
+                        category_chains:
+                          - id: "605196"
+                            local_name: "Mobil & Sepeda Motor"
+                            parent_id: "0"
+                          - id: "929928"
+                            local_name: "Elektronik Mobil"
+                            parent_id: "605196"
+                          - id: "931208"
+                            local_name: "Peralatan Elektrik untuk Mobil"
+                            parent_id: "929928"
+                        product_attributes:
+                          - id: "100107"
+                            name: "Jenis Garansi"
+                            values:
+                              - id: "1000054"
+                                name: "Garansi Produsen"
+                        package_weight:
+                          unit: "KILOGRAM"
+                          value: "0.01"
+                        package_dimensions:
+                          length: "10"
+                          width: "10"
+                          height: "10"
+                          unit: "CENTIMETER"
+                        is_cod_allowed: true
+                        has_draft: true
+                        sales_regions:
+                          - "ID"
+
+        "400":
+          description: Parameter tidak valid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: ENDPOINT_NOT_SUPPORTED
+                  message: "endpoint 'product_detail' not supported for marketplace 'shopee'"
+        "500":
+          description: Error dari marketplace upstream
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: UPSTREAM_ERROR
+                  message: "upstream request failed"
+                  marketplace: shopee
+                  original_status: 500
+                  original_code: "500"
+                  request_id: "8cd88fda-3d14-4859-ba2f-85ea867332af"
+
+  # ===========================================================================
+  # ORDER ENDPOINT (TikTok)
+  # ===========================================================================
+
+  /order:
+    get:
+      summary: Order List & Detail (Shopee & TikTok)
+      description: |
+        Satu endpoint dinamis untuk **order** — menggabungkan **Get Order List**
+        dan **Get Order Detail** Shopee & TikTok dalam satu route.
+
+        **Routing otomatis:**
+        - Query `ids` diisi → **Detail mode**
+          - Shopee: `GET /api/v2/order/get_order_detail`
+          - TikTok: `GET /order/202507/orders?ids=...`
+        - Query `ids` kosong → **List mode**
+          - Shopee: `GET /api/v2/order/get_order_list`
+          - TikTok: `POST /order/202309/orders/search`
+
+        **Default List mode (tanpa parameterisasi):**
+        - TikTok: status **`UNPAID`**, **`ON_HOLD`**, **`AWAITING_SHIPMENT`**
+        - Shopee: status **`UNPAID`**, **`READY_TO_SHIP`**
+
+        Karena TikTok & Shopee hanya menerima satu `order_status` per request,
+        gateway melakukan 1 API call per status, **menggabungkan (merge)** hasilnya,
+        lalu **mengagregasi** line items per SKU/variant. Untuk Shopee, hasil merge
+        otomatis **di-enrich** dengan Get Order Detail (batch max 50 `order_sn` per
+        call) karena Get Order List hanya mengembalikan `order_sn` + `order_status`.
+
+        **Required Scope:** Shopee `orders` · TikTok `seller.order.info`
+
+        **Response mode:**
+        - Default: response terunifikasi `{ marketplace, reserved_stock }` — agregasi
+          line items per SKU/variant. Hanya order berstatus reserved per marketplace
+          yang dihitung ke `total_reserved_stock`:
+          - TikTok: `UNPAID`, `ON_HOLD`, `AWAITING_SHIPMENT`
+          - Shopee: `UNPAID`, `READY_TO_SHIP`
+        - **Cara hitung:** TikTok tidak mengembalikan field `quantity` pada line items
+          (1 unit = 1 line item dengan `id` unik); Shopee mengembalikan
+          `model_quantity_purchased` (quantity eksplisit). Jadi `reserved_stock` per
+          order = jumlah unit line item dengan `sku_id` (Shopee: `model_id`) yang sama.
+        - `translate=false` → raw (merged) response marketplace
+      operationId: listOrders
+      tags:
+        - Orders
+      parameters:
+        - name: marketplace
+          in: query
+          required: true
+          description: Marketplace target (hanya tiktok untuk saat ini)
+          schema:
+            type: string
+            enum: [tiktok]
+          example: tiktok
+
+        - name: shop_uuid
+          in: query
+          required: true
+          description: UUID shop TikTok yang terdaftar di credentials.json
+          schema:
+            type: string
+          example: "7494709429666874412"
+
+        - name: ids
+          in: query
+          description: |
+            Order IDs dipisahkan koma (max 50). Jika diisi → **Detail mode**
+            (Get Order Detail). Jika kosong → **List mode** (Get Order List).
+          schema:
+            type: string
+          example: "576461413038785752,576461413038785753"
+
+        - name: status
+          in: query
+          description: |
+            Filter status order (List mode). Default per marketplace (semua
+            di-fetch dan di-merge):
+            - TikTok: `UNPAID`, `ON_HOLD`, `AWAITING_SHIPMENT`
+            - Shopee: `UNPAID`, `READY_TO_SHIP`
+
+            Nilai yang didukung TikTok:
+            `UNPAID`, `ON_HOLD`, `AWAITING_SHIPMENT`, `PARTIALLY_SHIPPING`,
+            `AWAITING_COLLECTION`, `IN_TRANSIT`, `DELIVERED`, `COMPLETED`, `CANCELLED`
+
+            Nilai yang didukung Shopee:
+            `UNPAID`, `READY_TO_SHIP`, `SHIPPED`, `COMPLETED`, `CANCELLED`,
+            `IN_CANCEL`, `INVOICE_PENDING`
+          schema:
+            type: string
+          example: UNPAID
+
+        - name: page
+          in: query
+          description: Nomor halaman (metadata response)
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+          example: 1
+
+        - name: page_size
+          in: query
+          description: "Jumlah order per halaman (1–100, TikTok & Shopee)"
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          example: 20
+
+        - name: page_token
+          in: query
+          description: Cursor pagination — isi dengan `next_page_token` dari response sebelumnya
+          schema:
+            type: string
+          example: "6AsPQsUMvH3RkchNUPPh22NROHkE0D8pmq/N5M1kHYcZmtRyv9aVrNv65W7Q6tFA+7D1ud64MPNz5OaT"
+
+        - name: sort_field
+          in: query
+          description: Field sorting (List mode)
+          schema:
+            type: string
+            enum: [create_time, update_time]
+            default: create_time
+          example: create_time
+
+        - name: sort_order
+          in: query
+          description: Arah sorting (List mode)
+          schema:
+            type: string
+            enum: [ASC, DESC]
+            default: DESC
+          example: DESC
+
+        - name: create_time_ge
+          in: query
+          description: Filter order dibuat pada/Setelah Unix timestamp
+          schema:
+            type: integer
+          example: 1710000000
+
+        - name: create_time_lt
+          in: query
+          description: Filter order dibuat sebelum Unix timestamp
+          schema:
+            type: integer
+          example: 1719999999
+
+        - name: update_time_ge
+          in: query
+          description: Filter order diupdate pada/Setelah Unix timestamp
+          schema:
+            type: integer
+          example: 1710000000
+
+        - name: update_time_lt
+          in: query
+          description: Filter order diupdate sebelum Unix timestamp
+          schema:
+            type: integer
+          example: 1719999999
+
+        - name: shipping_type
+          in: query
+          description: Metode pengiriman (List mode)
+          schema:
+            type: string
+            enum: [TIKTOK, SELLER, TIKTOK_DIGITAL]
+          example: TIKTOK
+
+        - name: buyer_user_id
+          in: query
+          description: Filter berdasarkan buyer user ID
+          schema:
+            type: string
+          example: "7213489962827123654"
+
+        - name: is_buyer_request_cancel
+          in: query
+          description: Filter order dengan permintaan cancel dari buyer
+          schema:
+            type: boolean
+          example: false
+
+        - name: warehouse_ids
+          in: query
+          description: Filter gudang — pisahkan dengan koma (multi-warehouse)
+          schema:
+            type: string
+          example: "7000714532876273888,7000714532876273666"
+
+        - name: translate
+          in: query
+          description: |
+            `false` → kembalikan raw (merged) response TikTok tanpa normalisasi.
+            Default `true` → response terunifikasi `{ marketplace, orders, pagination }`.
+          schema:
+            type: boolean
+            default: true
+          example: true
+
+      responses:
+        "200":
+          description: |
+            Order berhasil didapatkan.
+
+            **List mode** → semua order yang di-fetch **di-merge** lalu **diagregasi**
+            per SKU/variant menjadi `reserved_stock[]`.
+            **Detail mode** → order sesuai `ids` yang diminta ikut diagregasi.
+
+            **Catatan:** response translate final **hanya** berisi agregasi
+            `{ marketplace, reserved_stock }` (tanpa array `orders` & `pagination`).
+            Hanya order berstatus `UNPAID`, `ON_HOLD`, atau `AWAITING_SHIPMENT`
+            yang dihitung ke `total_reserved_stock`.
+          content:
+            application/json:
+              example:
+                marketplace: tiktok
+                reserved_stock:
+                  - product_id: "1736033390941733932"
+                    variants:
+                      - variant_id: "1736032926678615084"
+                        seller_sku: "1A1"
+                        total_reserved_stock: 8
+                        orders:
+                          - order_id: "576461413038785752"
+                            status: UNPAID
+                            reserved_stock: 3
+                          - order_id: "576461413038785753"
+                            status: ON_HOLD
+                            reserved_stock: 5
+                  - product_id: "1736268650108650540"
+                    variants:
+                      - variant_id: "1736268732805121068"
+                        seller_sku: "1K1"
+                        total_reserved_stock: 2
+                        orders:
+                          - order_id: "585150072415487781"
+                            status: AWAITING_SHIPMENT
+                            reserved_stock: 2
+        "400":
+          description: Parameter tidak valid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalidParameter:
+                  summary: Parameter tidak valid
+                  value:
+                    error:
+                      code: INVALID_PARAMETER
+                      message: "invalid parameter value"
+                      marketplace: shopee
+        "500":
+          description: Error dari TikTok upstream
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: UPSTREAM_ERROR
+                  message: "upstream request failed"
+                  marketplace: tiktok
+                  original_status: 500
+                  original_code: "36009003"
+                  request_id: "8cd88fda-3d14-4859-ba2f-85ea867332af"
+        "502":
+          description: Gagal fetch order untuk semua status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: UPSTREAM_ERROR
+                  message: "failed to fetch orders from marketplace"
+
+  # ===========================================================================
+  # WEBHOOK FORWARDER
+  # ===========================================================================
+
+  /webhook/register:
+    post:
+      summary: Daftarkan URL Backend untuk Webhook Forwarding
+      description: |
+        Mendaftarkan URL backend yang akan menerima forwarded webhook dari marketplace.
+
+        Setelah URL didaftarkan, setiap webhook yang diterima dari Shopee atau TikTok
+        akan otomatis diferuskan (forward) ke URL backend dalam format:
+
+        ```json
+        {
+          "marketplace": "shopee|tiktok",
+          "event_type": "stock_update|challenge|...",
+          "received_at": "2026-07-22T10:00:00Z",
+          "payload": { ... original webhook body ... }
+        }
+        ```
+
+        **Satu URL untuk semua marketplace** — webhook dari Shopee dan TikTok
+        dikirim ke URL yang sama.
+
+        **Async forwarding** — forwarding dilakukan secara asinkron setelah response
+        dikirim ke marketplace, jadi tidak mempengaruhi latency.
+      operationId: registerWebhook
+      tags:
+        - Webhook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - url
+              properties:
+                url:
+                  type: string
+                  description: URL backend yang akan menerima forwarded webhooks
+                  format: uri
+                  example: "https://my-backend.com/webhooks/receiver"
+      responses:
+        "200":
+          description: URL berhasil didaftarkan
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: "webhook forwarder URL registered"
+                  data:
+                    type: object
+                    properties:
+                      backend_url:
+                        type: string
+                        example: "https://my-backend.com/webhooks/receiver"
+                      updated_at:
+                        type: string
+                        format: date-time
+                        example: "2026-07-22T10:00:00Z"
+        "400":
+          description: Request tidak valid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                missingUrl:
+                  summary: URL tidak disertakan
+                  value:
+                    success: false
+                    error:
+                      code: MISSING_URL
+                      message: "'url' field is required and must be a non-empty string"
+                invalidUrl:
+                  summary: Format URL salah
+                  value:
+                    success: false
+                    error:
+                      code: INVALID_URL
+                      message: "'url' must start with http:// or https://"
+        "500":
+          description: Gagal menyimpan konfigurasi
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                success: false
+                error:
+                  code: SAVE_FAILED
+                  message: "failed to save webhook forwarder URL"
+
+    get:
+      summary: Cek URL Backend Terdaftar
+      description: Mengembalikan URL backend yang sedang terdaftar untuk webhook forwarding.
+      operationId: getWebhookRegistration
+      tags:
+        - Webhook
+      responses:
+        "200":
+          description: Konfigurasi forwarder
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    nullable: true
+                    properties:
+                      backend_url:
+                        type: string
+                        example: "https://my-backend.com/webhooks/receiver"
+                      updated_at:
+                        type: string
+                        format: date-time
+                        example: "2026-07-22T10:00:00Z"
+
+  # ===========================================================================
+  # HEALTH / INFO
+  # ===========================================================================
+
+  /:
+    get:
+      summary: Root endpoint
+      description: Root endpoint — mengembalikan informasi dasar gateway
+      operationId: rootInfo
+      tags:
+        - System
+      responses:
+        "200":
+          description: Informasi gateway
+          content:
+            application/json:
+              example:
+                service: "Unified Marketplace Gateway"
+                version: "1.0.0"
+                endpoints:
+                  - "POST /auth/token"
+                  - "POST /auth/refresh"
+                  - "POST /auth/status"
+                  - "GET /products"
+                  - "POST /products/create"
+                  - "GET /products/{id}"
+                  - "GET /order"
+                  - "POST /webhook/shopee"
+                  - "POST /webhook/tiktok"
+                  - "POST /webhook/register"
+                  - "GET /webhook/register"
+                marketplaces:
+                  - shopee
+                  - tiktok
+
+components:
+  schemas:
+    # ── Error Response ───────────────────────────────────────────────────
+    ErrorResponse:
+      type: object
+      description: >
+        Format error seragam untuk semua endpoint.
+        Field `original_status` dan `original_code` hanya ada jika error berasal
+        dari marketplace upstream (bukan dari gateway sendiri).
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              description: Kode error terunifikasi
+              example: UPSTREAM_ERROR
+            message:
+              type: string
+              nullable: true
+              description: Pesan error dalam bahasa Inggris
+              example: "upstream server returned an error"
+            marketplace:
+              type: string
+              nullable: true
+              enum: [shopee, tiktok]
+              description: Marketplace asal error (null jika error dari gateway)
+            original_status:
+              type: integer
+              nullable: true
+              description: HTTP status code asli dari marketplace
+              example: 500
+            original_code:
+              type: string
+              nullable: true
+              description: Kode error asli dari marketplace
+              example: "product.error_unknown"
+            request_id:
+              type: string
+              nullable: true
+              description: ID unik request untuk tracing
+              example: "c0146e90-8e63-4efa-abac-8e875f7d3974"
+
+    # ── Error Codes ─────────────────────────────────────────────────────
+    ErrorCode:
+      type: string
+      enum:
+        - MISSING_MARKETPLACE
+        - UNSUPPORTED_MARKETPLACE
+        - MISSING_PARAMS
+        - MISSING_AUTH_CODE
+        - MARKETPLACE_MISMATCH
+        - ENDPOINT_NOT_FOUND
+        - ENDPOINT_NOT_SUPPORTED
+        - SHOP_NOT_FOUND
+        - SHOP_INACTIVE
+        - NO_TOKEN
+        - NO_REFRESH_TOKEN
+        - REAUTH_REQUIRED
+        - REFRESH_TOKEN_EXPIRED
+        - TOKEN_ERROR
+        - REFRESH_ERROR
+        - CREDENTIALS_ERROR
+        - INVALID_PARAMETER
+        - UNAUTHORIZED
+        - FORBIDDEN
+        - NOT_FOUND
+        - RATE_LIMITED
+        - UPSTREAM_ERROR
+        - INTERNAL_ERROR
+        - NO_ADAPTER
+        - NO_CREDENTIALS
+        - NO_SHOPS
+        - NO_ACTIVE_SHOPS
+        - FANOUT_ERROR
+        - MAPPING_ERROR
+        - ADAPTER_LOAD_FAILED
+      description: |
+        Daftar semua error codes yang mungkin:
+
+        | Code | HTTP Status | Description |
+        |------|-------------|-------------|
+        | MISSING_MARKETPLACE | 400 | Parameter marketplace tidak disertakan |
+        | UNSUPPORTED_MARKETPLACE | 400 | Marketplace tidak didukung |
+        | MISSING_PARAMS | 400 | Parameter wajib tidak disertakan |
+        | MISSING_AUTH_CODE | 400 | Auth code tidak disertakan |
+        | MARKETPLACE_MISMATCH | 400 | Shop bukan untuk marketplace ini |
+        | ENDPOINT_NOT_FOUND | 404 | Endpoint tidak dikenal |
+        | ENDPOINT_NOT_SUPPORTED | 400 | Endpoint tidak didukung marketplace |
+        | SHOP_NOT_FOUND | 404 | Shop UUID tidak ditemukan |
+        | SHOP_INACTIVE | 403 | Status shop bukan active |
+        | NO_TOKEN | 401 | Belum ada access token |
+        | NO_REFRESH_TOKEN | 400 | Tidak ada refresh token |
+        | REAUTH_REQUIRED | 401 | Refresh token expired |
+        | REFRESH_TOKEN_EXPIRED | 401 | Refresh token expired |
+        | TOKEN_ERROR | 400 | Gagal mendapatkan token |
+        | REFRESH_ERROR | 400 | Gagal refresh token |
+        | CREDENTIALS_ERROR | 400 | Error kredensial |
+        | INVALID_PARAMETER | 400 | Parameter tidak valid |
+        | UNAUTHORIZED | 401 | Autentikasi gagal |
+        | FORBIDDEN | 403 | Tidak punya akses |
+        | NOT_FOUND | 404 | Resource tidak ditemukan |
+        | RATE_LIMITED | 429 | Rate limit tercapai |
+        | UPSTREAM_ERROR | 500 | Error dari marketplace |
+        | INTERNAL_ERROR | 500 | Internal gateway error |
+        | FANOUT_ERROR | 502 | Semua marketplace gagal di fan-out |
+
+    # ── Mapping Reference ──────────────────────────────────────────────
+    ParameterMapping:
+      type: object
+      description: >
+        Mapping parameter unified ke format spesifik marketplace.
+      properties:
+        marketplace:
+          type: string
+          enum: [shopee, tiktok]
+        unified_param:
+          type: string
+          description: Nama parameter di API Gateway
+        marketplace_param:
+          type: string
+          description: Nama parameter yang dikirim ke marketplace API
+      example:
+        - marketplace: shopee
+          unified: "page"
+          shopee: "offset = (page-1) × page_size"
+        - marketplace: shopee
+          unified: "page_size"
+          shopee: "page_size"
+        - marketplace: shopee
+          unified: "keyword"
+          shopee: "search_keyword"
+        - marketplace: shopee
+          unified: "status (ACTIVE)"
+          shopee: "item_status = NORMAL"
+        - marketplace: tiktok
+          unified: "page"
+          tiktok: "page_token (cursor-based)"
+        - marketplace: tiktok
+          unified: "page_size"
+          tiktok: "page_size"
+        - marketplace: tiktok
+          unified: "status (ACTIVE)"
+          tiktok: "status = ACTIVATE (dalam POST body)"
+
+  # ── Request Body Schemas ─────────────────────────────────────────────
+  requestBodies:
+    AuthRequest:
+      type: object
+      required:
+        - marketplace
+        - shop_uuid
+      properties:
+        marketplace:
+          type: string
+          enum: [shopee, tiktok]
+        shop_uuid:
+          type: string
+
+tags:
+  - name: Authentication
+    description: |
+      **Token Management Endpoints**
+
+      Gateway menggunakan **plugin chain** untuk autentikasi otomatis:
+
+      ```
+      Request → credential-loader (rewrite) → marketplace-router (rewrite)
+      → request-transformer (access)
+      ```
+
+      - **credential-loader**: Load kredensial shop + auto-refresh token jika expired
+      - **marketplace-router**: Tentukan adapter marketplace
+      - **request-transformer**: Generate signature HMAC-SHA256, call API langsung via resty.http
+
+      **Auto-Refresh:** Gateway secara otomatis me-refresh access token yang expired
+      saat melakukan product API calls — tanpa perlu manual refresh.
+
+  - name: Products
+    description: |
+      **Product Endpoints**
+
+      Semua response produk adalah **RAW dari marketplace** — tidak dinormalisasi.
+
+      **Auto Detail Enrichment:**
+      Saat mengakses `GET /products`, gateway secara otomatis:
+      1. Fetch product list dari marketplace
+      2. Extract product IDs
+      3. Fetch detail untuk setiap produk
+      4. Embed `_detail` field di setiap entry produk
+
+      **Shopee:** Batch fetch via `get_item_base_info` (1 API call)
+      **TikTok:** Per-product fetch via `/product/202309/products/{id}` (N API calls)
+
+  - name: Orders
+    description: |
+      **Order Endpoints (Shopee & TikTok)**
+
+      `GET /order` adalah endpoint dinamis yang menggabungkan Get Order List
+      dan Get Order Detail Shopee & TikTok:
+
+      - `ids` diisi → Detail mode
+        (Shopee: `GET /api/v2/order/get_order_detail` · TikTok: `GET /order/202507/orders?ids=...`)
+      - `ids` kosong → List mode
+        (Shopee: `GET /api/v2/order/get_order_list` · TikTok: `POST /order/202309/orders/search`)
+
+      Default tanpa parameterisasi:
+      - TikTok mengambil status `UNPAID`, `ON_HOLD`, dan `AWAITING_SHIPMENT`
+      - Shopee mengambil status `UNPAID` dan `READY_TO_SHIP`
+
+      Response dari setiap status **di-merge** ke satu array, lalu diagregasi
+      menjadi `reserved_stock` per SKU/variant.
+
+  - name: System
+    description: Endpoint informasi sistem
+
+# ── External Docs ──────────────────────────────────────────────────────────
+externalDocs:
+  description: Dokumentasi lengkap (README)
+  url: ./DOCUMENTATION.md

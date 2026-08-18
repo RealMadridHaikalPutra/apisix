@@ -1,0 +1,113 @@
+{
+  "_comment": "INI ADALAH PENGATURAN 'FIELD YANG BOLEH DI-UPDATE' UNTUK TIAP ENDPOINT.\n\nFungsinya: menentukan field apa saja yang boleh diubah oleh user lewat API gateway ke marketplace (Shopee/TikTok). Hanya field yang TERTULIS DI DAFTAR 'updatable_fields' yang diteruskan ke marketplace — field lain DITOLAK (400 INVALID_FIELD). Ini demi keamanan agar user tidak bisa mengubah field sembarangan.\n\nCARA PAKAI (untuk user awam):\n1. Mau izinkan field baru di-update? → Tulis nama field-nya di daftar updatable_fields (gunakan nama field marketplace asli, misal \"item_name\").\n2. Mau BLOKIR endpoint ini total (tidak bisa diakses sama sekali, request body apapun ditolak)? → Ubah \"enabled\" menjadi false.\n3. Setelah edit, restart: docker compose restart apisix.\n\nCATATAN:\n- Setiap daftar updatable_fields SUDAH TERISI dengan field yang memang bisa di-update di endpoint itu. Untuk update_status, hanya 'status' yang bisa diubah — daftar berisi 'status' sebagai penanda.\n- Field yang TIDAK boleh di-update (ID produk, category, field kontrol gateway, dll) otomatis diblokir — tidak perlu diatur di sini.",
+  "version": "1.3.0",
+  "endpoints": {
+    "create_product": {
+      "_comment": "Endpoint MEMBUAT produk baru (POST /products/create). Daftar field yang boleh di-set user saat create.",
+      "shopee": {
+        "_comment": "Shopee add_item. Field utama (title, description, category_id, dst) sudah otomatis dipetakan gateway dari nama umum. Daftar ini berisi field NATIVE Shopee tambahan yang diizinkan. Mau izinkan field lain? Tambahkan nama native-nya di sini.",
+        "enabled": false,
+        "updatable_fields": [
+          "normal_stock",
+          "days_to_ship",
+          "wholesale",
+          "size_chart"
+        ],
+        "field_map": {}
+      },
+      "tiktok": {
+        "_comment": "TikTok create product. Field yang boleh di-set saat create (nama TikTok asli). Field kontrol (category_id, skus, save_mode, idempotency_key) tetap diblokir gateway. Mau izinkan field lain? Tambahkan nama TikTok-nya di sini.",
+        "enabled": false,
+        "updatable_fields": [
+          "title",
+          "description",
+          "brand_id",
+          "main_images",
+          "is_cod_allowed",
+          "external_product_id",
+          "category_version",
+          "shipping_template_id",
+          "locale",
+          "auto_translate_enabled",
+          "search_terms",
+          "key_product_features",
+          "is_not_for_sale",
+          "is_pre_owned",
+          "minimum_order_quantity",
+          "shipping_insurance_requirement",
+          "delivery_option_ids",
+          "product_attributes",
+          "certifications",
+          "package_dimensions",
+          "package_weight",
+          "video",
+          "size_chart",
+          "scheduled_sale",
+          "manufacturer_ids",
+          "responsible_person_ids"
+        ],
+        "field_map": {}
+      }
+    },
+    "update_stock": {
+      "_comment": "Endpoint MENGUBAH STOK produk (POST /update-stock/{product_id}). Field yang boleh di-update: data stok (skus).",
+      "shopee": {
+        "_comment": "Shopee update_stock. Satu-satunya yang bisa diubah adalah data stok — 'skus' (diolah gateway menjadi stock_list). Field lain ditolak (400 INVALID_FIELD).",
+        "enabled": false,
+        "updatable_fields": [
+          "skus"
+        ],
+        "field_map": {}
+      },
+      "tiktok": {
+        "_comment": "TikTok update inventory. Satu-satunya yang bisa diubah adalah data stok — 'skus' (diteruskan gateway). Field lain ditolak (400 INVALID_FIELD).",
+        "enabled": false,
+        "updatable_fields": [
+          "skus"
+        ],
+        "field_map": {}
+      }
+    },
+    "update_status": {
+      "_comment": "Endpoint MENGUBAH STATUS produk (POST /update-status/{product_id}).",
+      "shopee": {
+        "_comment": "Shopee update_item. HANYA 'status' yang boleh diubah (diolah gateway menjadi item_status) — daftar berisi 'status' sebagai penanda. MAU izinkan field lain? Tambahkan nama native-nya, contoh: [\"item_name\", \"description\", \"weight\"]. Field di luar daftar ditolak (400 INVALID_FIELD).",
+        "enabled": true,
+        "updatable_fields": [
+          "status"
+        ],
+        "field_map": {}
+      },
+      "tiktok": {
+        "_comment": "TikTok activate/deactivate (dari update_status). HANYA 'status' (ACTIVE/INACTIVE) yang bisa diubah — product_ids + listing_platforms diolah gateway. Endpoint efektif sebenarnya: activate_products / deactivate_products (lihat di bawah).",
+        "enabled": true,
+        "updatable_fields": [
+          "status"
+        ],
+        "field_map": {}
+      }
+    },
+    "activate_products": {
+      "_comment": "TikTok AKTIFKAN produk (POST /product/202309/products/activate) — dipanggil otomatis saat update-status dengan status=ACTIVE.",
+      "tiktok": {
+        "_comment": "HANYA 'status' yang bisa diubah (ACTIVE) — product_ids + listing_platforms diolah gateway. Field lain ditolak (400 INVALID_FIELD).",
+        "enabled": true,
+        "updatable_fields": [
+          "status"
+        ],
+        "field_map": {}
+      }
+    },
+    "deactivate_products": {
+      "_comment": "TikTok NONAKTIFKAN produk (POST /product/202309/products/deactivate) — dipanggil otomatis saat update-status dengan status=INACTIVE.",
+      "tiktok": {
+        "_comment": "HANYA 'status' yang bisa diubah (INACTIVE) — product_ids + listing_platforms diolah gateway. Field lain ditolak (400 INVALID_FIELD).",
+        "enabled": false,
+        "updatable_fields": [
+          "status"
+        ],
+        "field_map": {}
+      }
+    }
+  }
+}

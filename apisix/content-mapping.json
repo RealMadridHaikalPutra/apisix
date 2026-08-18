@@ -1,0 +1,48 @@
+{
+  "description": "CONTENT MAPPING: kamus nilai marketplace (Shopee & TikTok) → nilai internal untuk variabel APAPUN (status, kategori, brand, dll). standardization-config.json MEMBACA file ini TERLEBIH DAHULU, baru menerjemahkan data ke format seragam.",
+  "version": "1.0.0",
+  "fields": {
+    "status": {
+      "description": "Mapping status produk marketplace → status internal gateway. DUA FORMAT didukung per marketplace: (1) array: \"INTERNAL\": [\"NATIVE_1\", \"NATIVE_2\"] — banyak nilai native ke satu internal (native pertama = primary untuk arah ke marketplace); (2) sederhana: \"NATIVE\": \"internal\" — satu native ke satu internal.",
+      "internal_values": [
+        "ACTIVE",
+        "INACTIVE",
+        "PENDING",
+        "REJECTED",
+        "SUSPENDED",
+        "DRAFT",
+        "DELETED"
+      ],
+      "mappings": {
+        "shopee": {
+          "ACTIVE": ["NORMAL"],
+          "INACTIVE": ["UNLIST"],
+          "PENDING": ["REVIEWING"],
+          "REJECTED": ["BANNED"],
+          "DELETED": ["SELLER_DELETE", "SHOPEE_DELETE"]
+        },
+        "tiktok": {
+          "ACTIVE": ["ACTIVATE"],
+          "INACTIVE": ["SELLER_DEACTIVATED"],
+          "PENDING": ["PENDING"],
+          "REJECTED": ["FAILED"],
+          "SUSPENDED": ["PLATFORM_DEACTIVATED", "FREEZE"],
+          "DRAFT": ["DRAFT"],
+          "DELETED": ["DELETED"]
+        }
+      }
+    },
+    "category": {
+      "description": "CONTOH mapping variabel LAIN selain status — silakan sesuaikan isinya. Setelah field ini diisi, pakai di standardization-config.json dengan transform \"content_map\" + \"map_field\": \"category\" pada field yang diinginkan.",
+      "internal_values": [],
+      "mappings": {
+        "shopee": {
+          "NATIVE_CATEGORY_SHOPEE": "internal_category"
+        },
+        "tiktok": {
+          "NATIVE_CATEGORY_TIKTOK": "internal_category"
+        }
+      }
+    }
+  }
+}

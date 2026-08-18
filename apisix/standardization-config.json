@@ -1,0 +1,143 @@
+{
+  "products": {
+    "tiktok": {
+      "description": "TikTok product list standardization",
+      "product_root": "data.products",
+      "pagination": {
+        "total_count": "data.total_count",
+        "total_count_alt": "data.data.total_count",
+        "next_page_token": "data.next_page_token",
+        "next_page_token_alt": "data.data.next_page_token"
+      },
+      "fields": {
+        "external_product_id": { "source": "id", "transform": "string", "default": "" },
+        "product_name": { "source": "title", "default": "" },
+        "product_image": { "source": "_detail.data.main_images[0].urls[0]", "default": "" },
+        "product_image_alt": { "source": "_detail.data.main_images[0].uri", "transform": "uri_to_url" },
+        "category": { "source": "_detail.data.category_chains[-1].local_name", "default": "" },
+        "description": { "source": "_detail.data.description", "transform": "strip_html", "default": "" },
+        "description_alt": { "source": "description", "transform": "strip_html" },
+        "status": { "source": "status", "transform": "content_map", "map_field": "status", "default": "" },
+        "location_id": { "source": "skus[0].inventory[0].warehouse_id", "transform": "string", "default": "" },
+        "location_id_alt": { "source": "skus[0].warehouse_inventory[0].warehouse_id", "transform": "string" },
+        "total_available": { "source": "skus[].total_available_quantity", "transform": "sum", "default": 0 },
+        "total_available_alt": { "source": "skus[].inventory[].quantity", "transform": "sum", "default": 0 },
+        "total_reserved": { "source": "skus[].total_committed_quantity", "transform": "sum", "default": 0 },
+        "total_reserved_alt": { "source": "skus[].inventory[].committed_quantity", "transform": "sum", "default": 0 }
+      },
+      "skus": {
+        "source": "skus",
+        "fields": {
+          "external_variant_id": { "source": "id", "transform": "string", "default": "" },
+          "variant_name": { "source": "sales_attributes[0].name", "nullable": true },
+          "seller_sku": { "source": "seller_sku", "default": "" },
+          "seller_sku_alt": { "source": "sku_code" },
+          "inventory": { "source": "warehouse_inventory", "transform": "map_inventory", "default": [] },
+          "status": { "source": "status_info.status", "transform": "content_map", "map_field": "status", "default": "" }
+        }
+      },
+      "validation": {
+        "description": "Jika salah satu variabel wajib TIDAK MUNCUL atau bernilai 0/'' pada salah satu produk, gateway membalas HTTP error (default 500) supaya mapping diperbaiki lebih dulu. Tambahkan field lain di required_fields bila perlu (misal \"total_available\" jika harus > 0).",
+        "required_fields": ["external_product_id", "product_name", "status"],
+        "error_status": 500
+      }
+    },
+    "shopee": {
+      "description": "Shopee product list standardization",
+      "product_root": "response.item",
+      "pagination": {
+        "total_count": "response.total_count",
+        "total_count_alt": "response.item_count"
+      },
+      "fields": {
+        "external_product_id": { "source": "item_id", "transform": "string", "default": "" },
+        "product_name": { "source": "_detail.item_name", "default": "" },
+        "product_name_alt": { "source": "item_name" },
+        "product_image": { "source": "_detail.image.image_url_list[0]", "default": "" },
+        "category": { "source": "_detail.category_id", "transform": "string", "default": "" },
+        "description": { "source": "_detail.description_info.extended_description.field_list[].text", "transform": "concat_strip_html", "default": "" },
+        "status": { "source": "item_status", "transform": "content_map", "map_field": "status", "default": "" },
+        "inventory": { "source": "stock_info_v2.seller_stock", "transform": "map_inventory", "default": [] },
+        "location_id": { "source": "stock_info_v2.seller_stock[0].location_id", "transform": "string", "default": "" },
+        "location_id_alt": { "source": "location_id", "transform": "string" },
+        "total_available": { "source": "stock_info_v2.summary_info.total_available_stock", "default": 0 },
+        "total_available_alt": { "source": "stock", "default": 0 },
+        "total_reserved": { "source": "stock_info_v2.summary_info.total_reserved_stock", "default": 0 }
+      },
+      "skus": {
+        "source": "_model_raw.model",
+        "description": "SKU variants dari get_model_list. Produk TANPA variant (has_model=false → model list kosong) di-fallback ke satu SKU sintetis dari data item-level (fallback_to_item) sehingga array `skus` tidak pernah kosong — seller_sku diambil dari item_sku.",
+        "fallback_to_item": true,
+        "fields": {
+          "external_variant_id": { "source": "model_id", "transform": "string", "default": "" },
+          "variant_name": { "source": "model_name", "nullable": true },
+          "seller_sku": { "source": "model_sku", "default": "" },
+          "total_reserved_stock": { "source": "stock_info_v2.summary_info.total_reserved_stock", "default": 0 },
+          "total_available_stock": { "source": "stock_info_v2.summary_info.total_available_stock", "default": 0 },
+          "status": { "source": "model_status", "transform": "content_map", "map_field": "status", "default": "" }
+        },
+        "fallback_fields": {
+          "external_variant_id": { "source": "item_id", "transform": "string", "default": "" },
+          "variant_name": { "source": "_detail.item_name", "nullable": true },
+          "seller_sku": { "source": "_detail.item_sku", "default": "" },
+          "seller_sku_alt": { "source": "item_sku", "default": "" },
+          "total_reserved_stock": { "source": "stock_info_v2.summary_info.total_reserved_stock", "default": 0 },
+          "total_available_stock": { "source": "stock_info_v2.summary_info.total_available_stock", "default": 0 },
+          "status": { "source": "item_status", "transform": "content_map", "map_field": "status", "default": "" }
+        }
+      },
+      "validation": {
+        "description": "Jika salah satu variabel wajib TIDAK MUNCUL atau bernilai 0/'' pada salah satu produk, gateway membalas HTTP error (default 500) supaya mapping diperbaiki lebih dulu. Tambahkan field lain di required_fields bila perlu (misal \"total_available\" jika harus > 0).",
+        "required_fields": ["external_product_id", "product_name", "status"],
+        "error_status": 500
+      }
+    }
+  },
+  "orders": {
+    "shopee": {
+      "description": "Shopee order reserved-stock standardization",
+      "output_key": "reserved_stock",
+      "product_root": "reserved_stock",
+      "pagination": {
+        "total_count": "total_count",
+        "has_next": "has_more",
+        "next_page_token": "next_page_token"
+      },
+      "fields": {
+        "product_id": { "source": "product_id", "transform": "string", "default": "" }
+      },
+      "skus": {
+        "source": "variants",
+        "output_key": "variants",
+        "fields": {
+          "variant_id": { "source": "variant_id", "transform": "string", "default": "" },
+          "seller_sku": { "source": "seller_sku", "default": "" },
+          "total_reserved_stock": { "source": "total_reserved_stock", "default": 0 },
+          "orders": { "source": "orders", "transform": "as_array", "default": [] }
+        }
+      }
+    },
+    "tiktok": {
+      "description": "TikTok order reserved-stock standardization",
+      "output_key": "reserved_stock",
+      "product_root": "reserved_stock",
+      "pagination": {
+        "total_count": "total_count",
+        "next_page_token": "next_page_token"
+      },
+      "fields": {
+        "product_id": { "source": "product_id", "transform": "string", "default": "" }
+      },
+      "skus": {
+        "source": "variants",
+        "output_key": "variants",
+        "fields": {
+          "variant_id": { "source": "variant_id", "transform": "string", "default": "" },
+          "seller_sku": { "source": "seller_sku", "default": "" },
+          "total_reserved_stock": { "source": "total_reserved_stock", "default": 0 },
+          "orders": { "source": "orders", "transform": "as_array", "default": [] }
+        }
+      }
+    }
+  }
+}

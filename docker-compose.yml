@@ -1,0 +1,109 @@
+# =============================================================================
+# docker-compose.yml — Unified Marketplace Gateway
+# =============================================================================
+# Spins up:
+#   - etcd: Configuration store for APISIX
+#   - apisix: API Gateway with custom marketplace plugins
+#   - bootstrap: Auto-registers routes and upstreams at startup
+#
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f
+#
+# All routes are automatically registered at startup — no manual steps needed.
+# =============================================================================
+
+services:
+  # ── etcd: Configuration Store ────────────────────────────────────────────
+  etcd:
+    image: bitnamilegacy/etcd:3.5.13
+    environment:
+      - ETCD_ENABLE_V2=true
+      - ALLOW_NONE_AUTHENTICATION=yes
+      - ETCD_ADVERTISE_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+    volumes:
+      - etcd_data:/bitnami/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gateway-net
+
+  # ── APISIX: Unified Marketplace Gateway ─────────────────────────────────
+  apisix:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "9080:9080/tcp"   # HTTP Proxy — backend apps call this
+      - "9180:9180/tcp"   # Admin API — configure routes/plugins
+    volumes:
+      # Mount configuration (live-reloadable)
+      - ./apisix/conf/config.yaml:/usr/local/apisix/conf/config.yaml:ro
+
+      # Mount custom modules for development (overrides Dockerfile copies)
+      - ./apisix/plugins:/usr/local/apisix/custom/apisix/plugins:ro
+      - ./apisix/adapters:/usr/local/apisix/custom/adapters:ro
+      # Config files — read-write agar bisa diedit dari Config Center UI
+      - ./apisix/standardization-config.json:/usr/local/apisix/custom/standardization-config.json:rw
+      - ./apisix/content-mapping.json:/usr/local/apisix/custom/content-mapping.json:rw
+      - ./apisix/update-config.json:/usr/local/apisix/custom/update-config.json:rw
+      - ./apisix/utils:/usr/local/apisix/custom/utils:ro
+      - ./apisix/credentials:/usr/local/apisix/custom/credentials:ro
+      - ./apisix/mappings:/usr/local/apisix/custom/mappings:ro
+      # Config Center UI (static HTML/CSS/JS)
+      - ./config-center:/usr/local/apisix/custom/config-center:ro
+
+      # Mount shop credentials (read-write for token refresh persistence)
+      - ./credentials/credentials.json:/credentials/credentials.json
+
+      # Webhook data storage (persistent across restarts)
+      - webhook_data:/webhook-data
+
+    environment:
+      - CREDENTIAL_STORAGE_BACKEND=file
+      - CREDENTIAL_STORE_PATH=/credentials/credentials.json
+      - SHOPEE_PARTNER_ID=100001
+      - SHOPEE_PARTNER_KEY=test_partner_key_for_smoke_test
+      - SHOPEE_BASE_URL=https://partner.shopeemobile.com
+      - TIKTOK_APP_KEY=test_app_key
+      - TIKTOK_APP_SECRET=test_app_secret_for_smoke_test
+      - TIKTOK_BASE_URL=https://open-api.tiktokglobalshop.com
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9180/apisix/admin/routes", "-H", "X-API-KEY: edd1c9f034335f136f87ad84b625c8f1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    depends_on:
+      etcd:
+        condition: service_healthy
+    networks:
+      - gateway-net
+    restart: unless-stopped
+
+  # ── Bootstrap: Auto-register Routes, Upstreams & SSL ────────────────────
+  bootstrap:
+    image: curlimages/curl:latest
+    volumes:
+      - ./bootstrap/init.sh:/init.sh:ro
+    entrypoint: ["/bin/sh", "/init.sh"]
+    depends_on:
+      apisix:
+        condition: service_healthy
+    networks:
+      - gateway-net
+    restart: "no"
+
+networks:
+  gateway-net:
+    driver: bridge
+
+volumes:
+  etcd_data:
+  webhook_data:

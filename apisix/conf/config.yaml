@@ -1,0 +1,62 @@
+apisix:
+  node_listen: 9080
+  enable_admin: true
+
+  # Path to custom Lua modules (mounted via Docker volume)
+  extra_lua_path: "/usr/local/apisix/custom/?.lua"
+
+nginx_config:
+  http_config:
+    access_log: "/dev/stdout"
+    error_log: "/dev/stderr info"
+
+deployment:
+  admin:
+    allow_admin:
+      - 0.0.0.0/0
+
+    admin_key:
+      - name: admin
+        key: edd1c9f034335f136f87ad84b625c8f1
+        role: admin
+
+    # Enable embedded APISIX Dashboard UI
+    enable_admin_ui: true
+
+  etcd:
+    host:
+      - "http://etcd:2379"
+
+# Plugin list — overrides defaults, so include built-in plugins we need
+plugins:
+  # Built-in plugins (commonly used subset)
+  - real-ip
+  - client-control
+  - proxy-rewrite
+  - response-rewrite
+  - body-transformer
+  - cors
+  - fault-injection
+  - key-auth
+  - basic-auth
+  - jwt-auth
+  - hmac-auth
+  - limit-conn
+  - limit-req
+  - limit-count
+  - prometheus
+  - public-api
+  - redirect
+  - serverless-pre-function
+  - serverless-post-function
+
+  # Custom marketplace gateway plugins
+  - credential-loader
+  - marketplace-router
+  - request-transformer
+  - response-normalizer
+  - error-mapper
+  - token-manager
+  - webhook-receiver
+  - webhook-registrar
+  - config-center
