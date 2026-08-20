@@ -653,15 +653,29 @@ function _M.standardize(endpoint, marketplace, enriched_json, unified_params)
     end
 
     -- ── Validasi Hasil Standardisasi ────────────────────────────────────
-    -- Jika ada variabel WAJIB yang TIDAK MUNCUL atau bernilai 0/'' pada salah
-    -- satu item, standardisasi dianggap GAGAL. Standardizer mengembalikan
-    -- (nil, error) — plugin request-transformer membalasnya dengan HTTP error
-    -- (default 500, bisa diatur via validation.error_status) supaya mapping
-    -- diperbaiki lebih dulu, bukan mengirim data yang salah.
+    -- Jika ADA field yang bernilai null/'', standardisasi dianggap GAGAL.
+    -- Standardizer mengembalikan (nil, error) — plugin request-transformer
+    -- membalasnya dengan HTTP error supaya mapping diperbaiki lebih dulu.
     local validation = mp_config.validation
     if validation then
         local issues = validate_output(products, sku_config, validation)
         if #issues > 0 then
+            -- Bangun pesan error detail: field apa yang bermasalah
+            local detail_parts = {}
+            for _, issue in ipairs(issues) do
+                local val_str = issue.reason == "missing" and "null"
+                    or issue.reason == "empty" and "\"\""
+                    or tostring(issue.value)
+                local loc = issue.sku_index
+                    and string.format("products[%d].skus[%d]", issue.product_index, issue.sku_index)
+                    or string.format("products[%d]", issue.product_index)
+                detail_parts[#detail_parts + 1] = string.format(
+                    "Field '%s' pada %s bernilai %s — coba perbaiki mapping di standardization-config.json / content-mapping.json",
+                    issue.field, loc, val_str
+                )
+            end
+            local detail_msg = table.concat(detail_parts, "\n")
+
             logger.error("Standardizer: validation failed", {
                 endpoint     = endpoint,
                 marketplace  = marketplace,
@@ -669,7 +683,7 @@ function _M.standardize(endpoint, marketplace, enriched_json, unified_params)
             })
             return nil, {
                 code         = "STANDARDIZATION_VALIDATION_FAILED",
-                message      = "satu atau lebih variabel hasil standardisasi tidak muncul atau bernilai 0 — periksa & perbaiki mapping di standardization-config.json / content-mapping.json",
+                message      = detail_msg,
                 endpoint     = endpoint,
                 marketplace  = marketplace,
                 error_status = tonumber(validation.error_status) or 500,
@@ -754,38 +768,34 @@ end
 
 -- ── Validation Helpers ────────────────────────────────────────────────────
 
---- Cek sebuah nilai field: nil/cjson.null → "missing", 0 → "zero", "" → "empty".
+--- Cek sebuah nilai field: nil/cjson.null → "missing", "" → "empty".
+-- Catatan: angka 0 TIDAK dianggap gagal — 0 adalah nilai valid.
 -- @param field - Nama field (untuk pesan issue)
 -- @param value - Nilai field pada item hasil standardisasi
--- @return string|nil - Alasan gagal (missing/zero/empty), atau nil jika valid
+-- @return string|nil - Alasan gagal (missing/empty), atau nil jika valid
 local function check_required_value(field, value)
     if value == nil or value == cjson.null then
         return "missing"
-    end
-    if type(value) == "number" then
-        if value == 0 then
-            return "zero"
-        end
-        return nil
     end
     if type(value) == "string" then
         if value == "" then
             return "empty"
         end
-        return nil
     end
-    -- Table/boolean: dianggap ada (valid)
+    -- number (termasuk 0), table, boolean: dianggap valid
     return nil
 end
 
 --- Validasi produk hasil standardisasi terhadap aturan validation config.
+-- SEMUA field pada produk & SKU dicek — jika ada yang nil/null/'', issues dikumpulkan.
 -- - validation.required_fields: field produk yang WAJIB muncul & tidak 0/''.
+--   (dipakai untuk kompatibilitas backward, tapi SEMUA field tetap dicek)
 -- - validation.required_sku_fields: field SKU yang WAJIB (diperiksa per SKU).
 -- - validation.error_status: HTTP status saat gagal (default 500).
 -- @param products - Array produk hasil standardisasi
 -- @param sku_config - Konfigurasi SKU (untuk nama key output skus)
 -- @param validation - Blok validation dari standardization-config.json
--- @return table - Array issue: { product_index, product_id, sku_index?, field, reason }
+-- @return table - Array issue: { product_index, product_id, sku_index?, field, reason, value }
 validate_output = function(products, sku_config, validation)
     local issues = {}
     local required_fields = validation.required_fields or {}
@@ -799,33 +809,35 @@ validate_output = function(products, sku_config, validation)
             or (p_idx - 1)
         )
 
-        for _, field in ipairs(required_fields) do
-            local reason = check_required_value(field, product[field])
+        -- ── Cek SEMUA field produk (bukan hanya required_fields) ──
+        for field_name, field_value in pairs(product) do
+            local reason = check_required_value(field_name, field_value)
             if reason then
                 issues[#issues + 1] = {
                     product_index = p_idx,
                     product_id    = product_id,
-                    field         = field,
+                    field         = field_name,
                     reason        = reason,
+                    value         = field_value,
                 }
             end
         end
 
-        if #required_sku_fields > 0 then
-            local skus = product[sku_output_key]
-            if type(skus) == "table" then
-                for s_idx, sku in ipairs(skus) do
-                    for _, field in ipairs(required_sku_fields) do
-                        local reason = check_required_value(field, sku[field])
-                        if reason then
-                            issues[#issues + 1] = {
-                                product_index = p_idx,
-                                product_id    = product_id,
-                                sku_index     = s_idx,
-                                field         = field,
-                                reason        = reason,
-                            }
-                        end
+        -- ── Cek SEMUA field SKU (bukan hanya required_sku_fields) ──
+        local skus = product[sku_output_key]
+        if type(skus) == "table" then
+            for s_idx, sku in ipairs(skus) do
+                for field_name, field_value in pairs(sku) do
+                    local reason = check_required_value(field_name, field_value)
+                    if reason then
+                        issues[#issues + 1] = {
+                            product_index = p_idx,
+                            product_id    = product_id,
+                            sku_index     = s_idx,
+                            field         = field_name,
+                            reason        = reason,
+                            value         = field_value,
+                        }
                     end
                 end
             end
