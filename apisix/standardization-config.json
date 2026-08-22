@@ -18,21 +18,22 @@
         "description": { "source": "_detail.data.description", "transform": "strip_html", "default": "" },
         "description_alt": { "source": "description", "transform": "strip_html" },
         "status": { "source": "status", "transform": "content_map", "map_field": "status", "default": "" },
-        "location_id": { "source": "skus[0].inventory[0].warehouse_id", "transform": "string", "default": "" },
+        "location_id": { "source": "_detail.data.skus[0].inventory[0].warehouse_id", "transform": "string", "default": "" },
         "location_id_alt": { "source": "skus[0].warehouse_inventory[0].warehouse_id", "transform": "string" },
+        "location_id_fallback": { "source": "skus[0].inventory[0].warehouse_id", "transform": "string" },
         "total_available": { "source": "skus[].total_available_quantity", "transform": "sum", "default": 0 },
         "total_available_alt": { "source": "skus[].inventory[].quantity", "transform": "sum", "default": 0 },
         "total_reserved": { "source": "skus[].total_committed_quantity", "transform": "sum", "default": 0 },
         "total_reserved_alt": { "source": "skus[].inventory[].committed_quantity", "transform": "sum", "default": 0 }
       },
       "skus": {
-        "source": "skus",
+        "source": "_detail.data.skus",
         "fields": {
           "external_variant_id": { "source": "id", "transform": "string", "default": "" },
           "variant_name": { "source": "sales_attributes[0].name", "nullable": true },
           "seller_sku": { "source": "seller_sku", "default": "" },
           "seller_sku_alt": { "source": "sku_code" },
-          "inventory": { "source": "warehouse_inventory", "transform": "map_inventory", "default": [] },
+          "inventory": { "source": "inventory", "transform": "map_inventory", "default": [] },
           "status": { "source": "status_info.status", "transform": "content_map", "map_field": "status", "default": "" }
         }
       },

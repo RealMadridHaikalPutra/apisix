@@ -89,16 +89,19 @@ local function parse_segment(segment)
     local idx = nil
 
     -- Check for [...] notation
-    local s, e = segment:find("%[")
+    local s = segment:find("%[")
     if s then
         key = segment:sub(1, s - 1)
-        local idx_str = segment:sub(s + 1, e - 1)
-        if idx_str == "" or idx_str == "*" then
-            idx = "all"
-        elseif idx_str == "-1" then
-            idx = -1
-        else
-            idx = tonumber(idx_str) or 0
+        local close_s = segment:find("%]", s)
+        if close_s then
+            local idx_str = segment:sub(s + 1, close_s - 1)
+            if idx_str == "" or idx_str == "*" then
+                idx = "all"
+            elseif idx_str == "-1" then
+                idx = -1
+            else
+                idx = tonumber(idx_str) or 0
+            end
         end
     end
 
@@ -396,7 +399,7 @@ transforms.map_inventory = function(value, data)
         local warehouse_id = item.warehouse_id or ""
         local location_id  = item.location_id or item.warehouse_id or ""
 
-        local available = tonumber(item.available_quantity or item.stock) or 0
+        local available = tonumber(item.available_quantity or item.stock or item.quantity) or 0
         local reserved  = tonumber(item.committed_quantity or item.reserved_stock)
         if reserved == nil and #value == 1 then
             -- Shopee single-location: per-location reserved is not provided,
@@ -658,7 +661,7 @@ function _M.standardize(endpoint, marketplace, enriched_json, unified_params)
     -- membalasnya dengan HTTP error supaya mapping diperbaiki lebih dulu.
     local validation = mp_config.validation
     if validation then
-        local issues = validate_output(products, sku_config, validation)
+        local issues = validate_output(products, sku_config, validation, fields)
         if #issues > 0 then
             -- Bangun pesan error detail: field apa yang bermasalah
             local detail_parts = {}
@@ -788,19 +791,51 @@ end
 
 --- Validasi produk hasil standardisasi terhadap aturan validation config.
 -- SEMUA field pada produk & SKU dicek — jika ada yang nil/null/'', issues dikumpulkan.
+-- Field yang ditandai `nullable: true` di config TIDAK dicek (dianggap valid).
 -- - validation.required_fields: field produk yang WAJIB muncul & tidak 0/''.
---   (dipakai untuk kompatibilitas backward, tapi SEMUA field tetap dicek)
 -- - validation.required_sku_fields: field SKU yang WAJIB (diperiksa per SKU).
 -- - validation.error_status: HTTP status saat gagal (default 500).
 -- @param products - Array produk hasil standardisasi
--- @param sku_config - Konfigurasi SKU (untuk nama key output skus)
+-- @param sku_config - Konfigurasi SKU (untuk nama key output skus + field configs)
 -- @param validation - Blok validation dari standardization-config.json
+-- @param product_fields - Konfigurasi field produk (untuk cek nullable)
 -- @return table - Array issue: { product_index, product_id, sku_index?, field, reason, value }
-validate_output = function(products, sku_config, validation)
+validate_output = function(products, sku_config, validation, product_fields)
     local issues = {}
     local required_fields = validation.required_fields or {}
     local required_sku_fields = validation.required_sku_fields or {}
     local sku_output_key = (sku_config and sku_config.output_key) or "skus"
+
+    -- ── Build lookup: field_name → nullable flag ────────────────────────
+    local nullable_fields = {}
+
+    -- Product-level nullable fields
+    if product_fields then
+        for field_name, field_config in pairs(product_fields) do
+            if field_config.nullable then
+                nullable_fields[field_name] = true
+            end
+        end
+    end
+
+    -- SKU-level nullable fields
+    local sku_fields = sku_config and sku_config.fields
+    if sku_fields then
+        for field_name, field_config in pairs(sku_fields) do
+            if field_config.nullable then
+                nullable_fields[field_name] = true
+            end
+        end
+    end
+    -- Also check fallback_fields for nullable
+    local fallback_fields = sku_config and sku_config.fallback_fields
+    if fallback_fields then
+        for field_name, field_config in pairs(fallback_fields) do
+            if field_config.nullable then
+                nullable_fields[field_name] = true
+            end
+        end
+    end
 
     for p_idx, product in ipairs(products) do
         local product_id = tostring(
@@ -809,35 +844,41 @@ validate_output = function(products, sku_config, validation)
             or (p_idx - 1)
         )
 
-        -- ── Cek SEMUA field produk (bukan hanya required_fields) ──
+        -- ── Cek SEMUA field produk (skip nullable) ──
         for field_name, field_value in pairs(product) do
-            local reason = check_required_value(field_name, field_value)
-            if reason then
-                issues[#issues + 1] = {
-                    product_index = p_idx,
-                    product_id    = product_id,
-                    field         = field_name,
-                    reason        = reason,
-                    value         = field_value,
-                }
+            -- Skip nullable fields — they're allowed to be nil/null
+            if not nullable_fields[field_name] then
+                local reason = check_required_value(field_name, field_value)
+                if reason then
+                    issues[#issues + 1] = {
+                        product_index = p_idx,
+                        product_id    = product_id,
+                        field         = field_name,
+                        reason        = reason,
+                        value         = field_value,
+                    }
+                end
             end
         end
 
-        -- ── Cek SEMUA field SKU (bukan hanya required_sku_fields) ──
+        -- ── Cek SEMUA field SKU (skip nullable) ──
         local skus = product[sku_output_key]
         if type(skus) == "table" then
             for s_idx, sku in ipairs(skus) do
                 for field_name, field_value in pairs(sku) do
-                    local reason = check_required_value(field_name, field_value)
-                    if reason then
-                        issues[#issues + 1] = {
-                            product_index = p_idx,
-                            product_id    = product_id,
-                            sku_index     = s_idx,
-                            field         = field_name,
-                            reason        = reason,
-                            value         = field_value,
-                        }
+                    -- Skip nullable fields — they're allowed to be nil/null
+                    if not nullable_fields[field_name] then
+                        local reason = check_required_value(field_name, field_value)
+                        if reason then
+                            issues[#issues + 1] = {
+                                product_index = p_idx,
+                                product_id    = product_id,
+                                sku_index     = s_idx,
+                                field         = field_name,
+                                reason        = reason,
+                                value         = field_value,
+                            }
+                        end
                     end
                 end
             end
