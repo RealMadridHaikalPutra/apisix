@@ -22,7 +22,7 @@ Middleware berbasis **Apache APISIX** yang menyediakan **satu API terpadu** untu
 | 📡 **Webhook Receiver** | ✅ | Terima real-time stock update dari Shopee & TikTok |
 | 🔄 **Auto-Retry on Auth Error** | ✅ | Force-refresh token + retry jika marketplace return 401 |
 | 📝 **Structured Logging** | ✅ | JSON logging dengan request_id untuk tracing |
-| 🎛 **Config Center (Web UI)** | ✅ | Ubah `update-config.json`, `content-mapping.json`, `standardization-config.json` dari browser di `http://localhost:9080/config` — dilindungi admin key APISIX |
+| 🎛 **Config Center (Web UI)** | ✅ | Route `/config` terdaftar — UI masih placeholder. Config saat ini diubah langsung dari file lalu restart. |
 
 ---
 
@@ -183,22 +183,28 @@ Saat `docker compose up`, service **bootstrap** (`bootstrap/init.sh`) secara **o
 | 2 | TikTok Products | `open-api.tiktokglobalshop.com` | 443 |
 | 3 | TikTok Auth | `auth.tiktok-shops.com` | 443 |
 
-#### Routes yang Teregister (17+ routes)
+#### Routes yang Teregister (17 routes)
 
-| Route | Method | URI | Kondisi | Plugins |
-|:-----:|:------:|-----|:-------:|:-------:|
+| Route ID | Method | URI | Kondisi | Plugins |
+|:--------:|:------:|-----|:-------:|:-------:|
 | 1 | GET,POST | `/products*` | marketplace=shopee | credential-loader, marketplace-router, request-transformer |
 | 2 | GET,POST | `/products*` | marketplace=tiktok | credential-loader, marketplace-router, request-transformer |
 | 3 | GET,POST | `/products*` | marketplace=all | credential-loader, marketplace-router, request-transformer |
-| 4 | POST | `/products/create` | marketplace=shopee | credential-loader, marketplace-router, request-transformer |
-| 5 | POST | `/products/create` | marketplace=tiktok | credential-loader, marketplace-router, request-transformer |
-| 6 | POST | `/update-stock*` | marketplace=shopee | credential-loader, marketplace-router, request-transformer |
-| 7 | POST | `/update-stock*` | marketplace=tiktok | credential-loader, marketplace-router, request-transformer |
-| 8 | POST | `/update-status*` | marketplace=shopee | credential-loader, marketplace-router, request-transformer |
-| 9 | POST | `/update-status*` | marketplace=tiktok | credential-loader, marketplace-router, request-transformer |
-| 10 | POST | `/webhook/shopee` | — | webhook-receiver |
-| 11 | POST | `/webhook/tiktok` | — | webhook-receiver |
-| 12 | POST | `/auth/*` | — | token-manager |
+| 1d | GET,POST | `/products*` | — (fallback tanpa marketplace) | credential-loader, marketplace-router, request-transformer |
+| 4 | POST | `/update-stock*` | marketplace=shopee | credential-loader, marketplace-router, request-transformer |
+| 5 | POST | `/update-stock*` | marketplace=tiktok | credential-loader, marketplace-router, request-transformer |
+| 12 | POST | `/update-status*` | marketplace=shopee | credential-loader, marketplace-router, request-transformer |
+| 13 | POST | `/update-status*` | marketplace=tiktok | credential-loader, marketplace-router, request-transformer |
+| 13b | POST | `/update-status*` | marketplace=all (ditolak) | credential-loader, request-transformer |
+| 13c | POST | `/update-stock*` | marketplace=all (ditolak) | credential-loader, request-transformer |
+| 14 | GET | `/order*` | marketplace=tiktok | credential-loader, marketplace-router, request-transformer |
+| 15 | GET | `/order*` | marketplace=shopee | credential-loader, marketplace-router, request-transformer |
+| 6 | POST | `/webhook/shopee` | — | webhook-receiver |
+| 7 | POST | `/webhook/tiktok` | — | webhook-receiver |
+| 8 | GET,POST | `/webhook/register` | — | webhook-registrar |
+| 10 | POST | `/auth/*` | — | token-manager |
+| 20 | GET,PUT | `/config*` | — | config-center |
+| 99 | ALL | `/*` | catch-all (priority -100) | request-transformer |
 
 ### 5. Verifikasi Gateway Berjalan
 
@@ -238,6 +244,8 @@ curl "http://localhost:9080/products?marketplace=tiktok&shop_uuid=74947094296668
 | `POST` | `/update-status/{product_id}` | Shopee, TikTok | Update status (ACTIVE/INACTIVE) |
 | `POST` | `/webhook/shopee` | Shopee | Terima webhook |
 | `POST` | `/webhook/tiktok` | TikTok | Terima webhook |
+| `GET,POST` | `/webhook/register` | — | Daftar/cek alamat backend untuk forward webhook |
+| `GET,PUT` | `/config*` | — | Config Center UI — kelola config dari browser |
 
 ---
 
@@ -248,6 +256,7 @@ curl "http://localhost:9080/products?marketplace=tiktok&shop_uuid=74947094296668
 | `test-create-products.sh` | Membuat 4 produk ke Shopee & TikTok |
 | `test-update-status.sh` | Test activate/deactivate produk |
 | `test-update-stock.sh` | Test update stock (legacy & native format) |
+| `test-order.sh` | Test order list & detail (Shopee & TikTok) |
 | `run-full-test-suite.sh` | Test suite lengkap semua endpoint |
 
 ```bash

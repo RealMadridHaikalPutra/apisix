@@ -53,7 +53,7 @@ Aplikasi Anda  ──►  [ SISTEM INI / GATEWAY ]  ──►  Shopee
 
 **Alamat utama sistem:** `http://localhost:9080`
 **Panel pengaturan (admin):** `http://localhost:9180/ui/`
-**Pusat pengaturan (Config Center):** `http://localhost:9080/config` — ubah `update-config.json`, `content-mapping.json`, dan `standardization-config.json` langsung dari browser (tanpa edit file manual).
+**Pusat pengaturan (Config Center):** `http://localhost:9080/config` — route sudah terdaftar tapi UI masih placeholder. Saat ini config diubah langsung dari file lalu restart.
 
 ---
 
@@ -135,6 +135,7 @@ Berikut ringkasan semua pintu yang tersedia di sistem ini:
 | `POST /webhook/shopee` | Terima notifikasi dari Shopee | Shopee |
 | `POST /webhook/tiktok` | Terima notifikasi dari TikTok | TikTok |
 | `GET/POST /webhook/register` | Atur alamat tujuan forward notifikasi | — |
+| `GET/PUT /config*` | Config Center — kelola config dari browser | — |
 
 > **Catatan penting:** hampir semua halaman butuh **dua keterangan wajib**:
 > `marketplace` (toko mana: `shopee` / `tiktok` / `all`) dan `shop_uuid` (toko yang mana).
@@ -653,8 +654,8 @@ Plugin ini yang dijalankan APISIX untuk setiap permintaan (berurutan sesuai fase
 | `credential-loader.lua` | Membaca `shop_uuid` dari request, memuat kredensial toko, dan memastikan toko terdaftar & aktif. |
 | `marketplace-router.lua` | Menentukan tujuan marketplace (`shopee`/`tiktok`/`all`) dan memuat adapter yang sesuai; juga menangani mode **fan-out** (`all`). |
 | `request-transformer.lua` | **Jantung sistem.** Menerjemahkan permintaan seragam → permintaan marketplace, membuat tanda tangan, memanggil API marketplace langsung, melengkapi detail produk, dan **mengulang otomatis** saat token mati. |
-| `response-normalizer.lua` | Merapikan jawaban mentah marketplace menjadi format seragam. |
-| `error-mapper.lua` | Menerjemahkan kode error marketplace menjadi kode error seragam. |
+| `response-normalizer.lua` | ⚠️ **Tidak digunakan di route.** File ini ada tapi tidak dipanggil oleh route manapun — normalisasi ditangani inline di `request-transformer.lua`. |
+| `error-mapper.lua` | ⚠️ **Tidak digunakan di route.** File ini ada tapi tidak dipanggil oleh route manapun — error mapping ditangani inline di `request-transformer.lua`. |
 | `token-manager.lua` | Mengurus halaman `/auth/token`, `/auth/refresh`, dan `/auth/status`. |
 | `webhook-receiver.lua` | Menerima notifikasi dari Shopee & TikTok, memverifikasi tanda tangan, lalu menyimpan & meneruskan pesan. |
 | `webhook-registrar.lua` | Mengurus halaman `/webhook/register` (mendaftarkan alamat tujuan forward). |
@@ -705,7 +706,7 @@ Plugin ini yang dijalankan APISIX untuk setiap permintaan (berurutan sesuai fase
 | `content-mapping.json` | **Kamus nilai marketplace** antar marketplace untuk variabel APAPUN — bukan hanya status (kategori, brand, dll). Contoh field `status`: `ACTIVE` → Shopee `NORMAL` / TikTok `ACTIVATE`; `INACTIVE` → Shopee `UNLIST` / TikTok `SELLER_DEACTIVATED`. `standardization-config.json` membaca file ini TERLEBIH DAHULU sebelum menerjemahkan data. |
 | `update-config.json` | **Pintu keamanan.** Menentukan field apa saja yang boleh diubah user lewat API. Hanya field di daftar `updatable_fields` (plus skema endpoint) yang diteruskan ke marketplace; field lain **ditolak (400 INVALID_FIELD)**. 📖 Panduan: [`PANDUAN-UPDATE-CONFIG.md`](PANDUAN-UPDATE-CONFIG.md). |
 
-> **🎛 Ubah dari browser (Config Center):** buka `http://localhost:9080/config` untuk mengubah ketiga file di atas (`update-config.json`, `content-mapping.json`, `standardization-config.json`) lewat antarmuka web — tanpa perlu edit file manual. **Akses dilindungi admin key APISIX** (`X-API-KEY` yang sama dengan Admin API) — masukkan key tersebut di halaman lalu klik **Hubungkan**. Saat klik **Simpan**, config langsung ditulis ke file dan **APISIX otomatis di-reload** (semua worker menerapkan perubahan) — tidak perlu restart manual.
+> **🎛 Config Center (status: placeholder):** buka `http://localhost:9080/config` — route ini sudah terdaftar (route 20) tapi UI-nya masih berupa halaman placeholder kosong. Untuk mengubah config saat ini, edit file secara langsung (`apisix/update-config.json`, `apisix/content-mapping.json`, `apisix/standardization-config.json`) lalu restart: `docker compose restart apisix`.
 
 #### 11.5.7 `apisix/conf/`
 

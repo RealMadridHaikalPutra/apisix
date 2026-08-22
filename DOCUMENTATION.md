@@ -23,9 +23,9 @@
    - [5.6 Simulasi Webhook](#56-simulasi-webhook)
 6. [Product Endpoints](#6-product-endpoints)
    - [6.1 GET /products — Daftar Produk](#61-get-products--daftar-produk)
-   - [6.3 Inventory Search via /products (TikTok Only)](#63-inventory-search-via-products-tiktok-only)
    - [6.2 GET /products/{id} — Detail Produk](#62-get-productsid--detail-produk)
-   - [5.3 GET /order — Order List & Detail (Shopee & TikTok)](#53-get-order--order-list--detail-shopee--tiktok)
+   - [6.3 Inventory Search via /products (TikTok Only)](#63-inventory-search-via-products-tiktok-only)
+   - [6.4 GET /order — Order List & Detail (Shopee & TikTok)](#64-get-order--order-list--detail-shopee--tiktok)
 7. [Unified Response Schema](#7-unified-response-schema)
    - [7.1 Schema Produk (Unified)](#71-schema-produk-unified)
    - [7.1a Unified `location_id` Field (Response)](#71a-unified-location_id-field-response)
@@ -178,10 +178,17 @@ curl -X POST http://localhost:9080/auth/refresh \
 | 13       | POST        | `/update-status*` | `marketplace=tiktok`    | 2 (TikTok)  | credential-loader, marketplace-router, request-transformer |
 | 14       | GET         | `/order*`     | `marketplace=tiktok`          | 2 (TikTok)  | credential-loader, marketplace-router, request-transformer |
 | 15       | GET         | `/order*`     | `marketplace=shopee`          | 1 (Shopee)  | credential-loader, marketplace-router, request-transformer |
+| 1d       | GET, POST   | `/products*`  | — (fallback tanpa marketplace) | 1 (Shopee)  | credential-loader, marketplace-router, request-transformer |
+| 13b      | POST        | `/update-status*` | `marketplace=all` (ditolak) | 1 (Shopee)  | credential-loader, request-transformer |
+| 13c      | POST        | `/update-stock*` | `marketplace=all` (ditolak) | 1 (Shopee)  | credential-loader, request-transformer |
+| 20       | GET, PUT    | `/config*`    | —                             | 1 (Shopee)  | config-center |
+| 99       | ALL         | `/*`          | catch-all (priority -100)      | 1 (Shopee)  | request-transformer |
 
 > **Catatan:** Inventory Search TikTok tidak lagi memiliki route terpisah. Sekarang digabung ke `/products` — kirim POST body dengan `product_ids` atau `sku_ids` untuk mengaksesnya. Lihat [6.3 Inventory Search via /products](#63-inventory-search-via-products).
 
 > **Catatan Route:** Route dipisah per marketplace menggunakan `vars` conditions APISIX (bukan dynamic `ctx.balancer_upstream_id` yang tidak stabil di APISIX 3.x). Plugin `response-normalizer` dan `error-mapper` **tidak digunakan** di route — normalisasi dan error mapping ditangani **inline** di `request-transformer.lua`.
+
+> **Catatan Config Center:** Route 20 (`/config*`) menggunakan plugin `config-center` yang saat ini berupa **placeholder** (UI default belum diimplementasikan). File `config-center/index.html` hanya berisi halaman statis kosong.
 
 ---
 
@@ -1555,7 +1562,7 @@ curl "http://localhost:9080/products/1736033390941733932?marketplace=tiktok&shop
 
 ---
 
-### 5.3 GET /order — Order List & Detail (Shopee & TikTok)
+### 6.4 GET /order — Order List & Detail (Shopee & TikTok)
 
 Satu endpoint dinamis untuk **order** — menggabungkan **Get Order List** dan **Get Order Detail** Shopee & TikTok dalam satu route. Routing otomatis ditentukan oleh parameter `ids`:
 
