@@ -32,6 +32,20 @@
         }
       }
     },
+    "product_id": {
+      "description": "Mapping id produk marketplace → id internal gateway. DUA FORMAT didukung per marketplace: (1) array: \"INTERNAL\": [\"NATIVE_1\", \"NATIVE_2\"] — banyak nilai native ke satu internal (native pertama = primary untuk arah ke marketplace); (2) sederhana: \"NATIVE\": \"internal\" — satu native ke satu internal.",
+      "internal_values": [
+        "product_id"
+      ],
+      "mappings": {
+        "shopee": {
+          "product_id": ["item_id"]
+        },
+        "tiktok": {
+          "product_id": ["id"]
+        }
+      }
+    },
     "category": {
       "description": "CONTOH mapping variabel LAIN selain status — silakan sesuaikan isinya. Setelah field ini diisi, pakai di standardization-config.json dengan transform \"content_map\" + \"map_field\": \"category\" pada field yang diinginkan.",
       "internal_values": [],

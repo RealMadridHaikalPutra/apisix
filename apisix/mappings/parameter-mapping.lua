@@ -260,10 +260,10 @@ local function tiktok_update_stock_body(params)
       -- Resolve quantity (TikTok 'quantity' vs legacy 'stock')
       local qty = tonumber(inv.quantity or inv.stock) or 0
 
-      -- Clamp to TikTok's valid range [1, 99999]
+      -- Clamp to TikTok's valid range [0, 99999]
       -- (Quantity = 0 is not allowed for in-stock; backorder_quantity is the
       --  proper way to express post-sellout inventory.)
-      if qty < 1 then qty = 1 end
+      if qty < 0 then qty = 0 end
       if qty > 99999 then qty = 99999 end
 
       local entry = { quantity = qty }

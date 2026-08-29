@@ -10,7 +10,7 @@
         "next_page_token_alt": "data.data.next_page_token"
       },
       "fields": {
-        "external_product_id": { "source": "id", "transform": "string", "default": "" },
+        "external_product_id": { "source": "id", "transform": "content_map", "map_field": "product_id", "default": "" },
         "product_name": { "source": "title", "default": "" },
         "product_image": { "source": "_detail.data.main_images[0].urls[0]", "default": "" },
         "product_image_alt": { "source": "_detail.data.main_images[0].uri", "transform": "uri_to_url" },
@@ -51,19 +51,19 @@
         "total_count_alt": "response.item_count"
       },
       "fields": {
-        "external_product_id": { "source": "item_id", "transform": "string", "default": "" },
+        "external_product_id": { "source": "item_id", "transform": "content_map", "map_field": "product_id", "default": "" },
         "product_name": { "source": "_detail.item_name", "default": "" },
         "product_name_alt": { "source": "item_name" },
         "product_image": { "source": "_detail.image.image_url_list[0]", "default": "" },
         "category": { "source": "_detail.category_id", "transform": "string", "default": "" },
         "description": { "source": "_detail.description_info.extended_description.field_list[].text", "transform": "concat_strip_html", "default": "" },
         "status": { "source": "item_status", "transform": "content_map", "map_field": "status", "default": "" },
-        "inventory": { "source": "stock_info_v2.seller_stock", "transform": "map_inventory", "default": [] },
-        "location_id": { "source": "stock_info_v2.seller_stock[0].location_id", "transform": "string", "default": "" },
+        "inventory": { "source": "_model_raw.model[0].stock_info_v2.seller_stock", "transform": "map_inventory", "default": [] },
+        "location_id": { "source": "_model_raw.model[0].stock_info_v2.seller_stock[0].location_id", "transform": "string", "default": "" },
         "location_id_alt": { "source": "location_id", "transform": "string" },
-        "total_available": { "source": "stock_info_v2.summary_info.total_available_stock", "default": 0 },
+        "total_available": { "source": "_model_raw.model[0].stock_info_v2.summary_info.total_available_stock", "default": 0 },
         "total_available_alt": { "source": "stock", "default": 0 },
-        "total_reserved": { "source": "stock_info_v2.summary_info.total_reserved_stock", "default": 0 }
+        "total_reserved": { "source": "_model_raw.model[0].stock_info_v2.summary_info.total_reserved_stock", "default": 0 }
       },
       "skus": {
         "source": "_model_raw.model",

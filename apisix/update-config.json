@@ -53,7 +53,7 @@
       "_comment": "Endpoint MENGUBAH STOK produk (POST /update-stock/{product_id}). Field yang boleh di-update: data stok (skus).",
       "shopee": {
         "_comment": "Shopee update_stock. Satu-satunya yang bisa diubah adalah data stok — 'skus' (diolah gateway menjadi stock_list). Field lain ditolak (400 INVALID_FIELD).",
-        "enabled": false,
+        "enabled": true,
         "updatable_fields": [
           "skus"
         ],
@@ -61,7 +61,7 @@
       },
       "tiktok": {
         "_comment": "TikTok update inventory. Satu-satunya yang bisa diubah adalah data stok — 'skus' (diteruskan gateway). Field lain ditolak (400 INVALID_FIELD).",
-        "enabled": false,
+        "enabled": true,
         "updatable_fields": [
           "skus"
         ],
