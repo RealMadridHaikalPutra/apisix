@@ -35,6 +35,7 @@ local _M = {
 local ADAPTER_REGISTRY = {
     shopee = nil,
     tiktok = nil,
+    lazada = nil,
 }
 
 --- Load and instantiate a marketplace adapter.
@@ -87,7 +88,7 @@ function _M.rewrite(conf, ctx)
         core.response.exit(400, {
             error = {
                 code = "MISSING_MARKETPLACE",
-                message = "query parameter 'marketplace' is required (shopee, tiktok, or all)",
+                message = "query parameter 'marketplace' is required (shopee, tiktok, lazada, or all)",
             }
         })
         return
@@ -96,7 +97,7 @@ function _M.rewrite(conf, ctx)
     marketplace = marketplace:lower()
 
     -- Validate marketplace
-    local supported = { shopee = true, tiktok = true, all = true }
+    local supported = { shopee = true, tiktok = true, lazada = true, all = true }
     if not supported[marketplace] then
         logger.warn("Unsupported marketplace", {
             marketplace = marketplace,
@@ -106,10 +107,10 @@ function _M.rewrite(conf, ctx)
             error = {
                 code = "UNSUPPORTED_MARKETPLACE",
                 message = string.format(
-                    "unsupported marketplace '%s'. Supported: shopee, tiktok, all",
+                    "unsupported marketplace '%s'. Supported: shopee, tiktok, lazada, all",
                     marketplace
                 ),
-                supported_marketplaces = { "shopee", "tiktok", "all" },
+                supported_marketplaces = { "shopee", "tiktok", "lazada", "all" },
             }
         })
         return
@@ -117,7 +118,8 @@ function _M.rewrite(conf, ctx)
 
     -- Handle fan-out mode: marketplace=all
     -- Users specify which shops to query via:
-    --   shop_uuid_shopee=<uuid>  and/or  shop_uuid_tiktok=<uuid>
+    --   shop_uuid_shopee=<uuid>, shop_uuid_tiktok=<uuid>,
+    --   and/or shop_uuid_lazada=<uuid>
     -- At least one must be provided.
     if marketplace == "all" then
         ctx.fanout = true
@@ -132,16 +134,17 @@ function _M.rewrite(conf, ctx)
         -- Read per-marketplace shop UUIDs from query params
         local shop_uuid_shopee = args.shop_uuid_shopee or ""
         local shop_uuid_tiktok = args.shop_uuid_tiktok or ""
+        local shop_uuid_lazada = args.shop_uuid_lazada or ""
 
         -- Validate: at least one must be provided
-        if shop_uuid_shopee == "" and shop_uuid_tiktok == "" then
+        if shop_uuid_shopee == "" and shop_uuid_tiktok == "" and shop_uuid_lazada == "" then
             logger.error("Fan-out mode: no shop UUIDs provided", {
                 request_id = ctx.request_id,
             })
             core.response.exit(400, {
                 error = {
                     code = "MISSING_PARAMS",
-                    message = "fan-out mode requires at least one of: shop_uuid_shopee or shop_uuid_tiktok",
+                    message = "fan-out mode requires at least one of: shop_uuid_shopee, shop_uuid_tiktok, shop_uuid_lazada",
                 }
             })
             return
@@ -244,12 +247,60 @@ function _M.rewrite(conf, ctx)
             target_shops[#target_shops + 1] = shop
         end
 
+        if shop_uuid_lazada ~= "" then
+            local shop = credential_store.get_shop(shop_uuid_lazada)
+            if not shop then
+                logger.error("Fan-out mode: Lazada shop not found", {
+                    shop_uuid = shop_uuid_lazada,
+                    request_id = ctx.request_id,
+                })
+                core.response.exit(404, {
+                    error = {
+                        code = "SHOP_NOT_FOUND",
+                        message = string.format("lazada shop '%s' not found", shop_uuid_lazada),
+                    }
+                })
+                return
+            end
+            if shop.marketplace ~= "lazada" then
+                logger.error("Fan-out mode: shop marketplace mismatch", {
+                    expected = "lazada",
+                    actual   = shop.marketplace,
+                    shop_uuid = shop_uuid_lazada,
+                    request_id = ctx.request_id,
+                })
+                core.response.exit(400, {
+                    error = {
+                        code = "MARKETPLACE_MISMATCH",
+                        message = string.format("shop '%s' is a '%s' shop, not 'lazada'", shop_uuid_lazada, shop.marketplace),
+                    }
+                })
+                return
+            end
+            if shop.status ~= "active" then
+                logger.error("Fan-out mode: Lazada shop not active", {
+                    shop_uuid = shop_uuid_lazada,
+                    status = shop.status,
+                    request_id = ctx.request_id,
+                })
+                core.response.exit(403, {
+                    error = {
+                        code = "SHOP_INACTIVE",
+                        message = string.format("lazada shop '%s' is not active", shop_uuid_lazada),
+                    }
+                })
+                return
+            end
+            target_shops[#target_shops + 1] = shop
+        end
+
         ctx.all_shops = target_shops
 
         logger.info("Multi-marketplace fan-out mode activated", {
             shop_count = #target_shops,
             shopee_uuid = shop_uuid_shopee,
             tiktok_uuid = shop_uuid_tiktok,
+            lazada_uuid = shop_uuid_lazada,
             request_id = ctx.request_id,
         })
         return

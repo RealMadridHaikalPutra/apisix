@@ -15,6 +15,9 @@
 --     uri_to_url, content_map (generic content-mapping.json lookup),
 --     status_tiktok, status_shopee, status_shopee_model, status_tiktok_sku
 --   - Fallback fields: field_alt, field_fallback
+--   - Alternative paths: "path1 || path2 || path3" — source dinilai berurutan,
+--     nilai non-nil PERTAMA yang dipakai. Berlaku untuk fields, skus.source,
+--     product_root dan pagination (alternatif _alt/_fallback tetap didukung).
 --   - Validation: mp_config.validation — jika variabel wajib hasil standardisasi
 --     TIDAK MUNCUL atau bernilai 0/'' pada salah satu item, standardisasi
 --     dianggap gagal dan mengembalikan error (HTTP 500 default, bisa diatur
@@ -164,6 +167,51 @@ local function navigate(root, path)
     return current
 end
 
+--- Split an alternative-path expression on `||`.
+-- e.g., "data.total_count || data.data.total_count"
+--   → { "data.total_count", "data.data.total_count" }
+-- @param path - Source string
+-- @return table|nil - Array of candidate paths, or nil if no `||` present
+local function split_alternatives(path)
+    if type(path) ~= "string" or not path:find("||", 1, true) then
+        return nil
+    end
+    local alternatives = {}
+    for alt in path:gmatch("[^|]+") do
+        alt = alt:match("^%s*(.-)%s*$")
+        if alt and alt ~= "" then
+            alternatives[#alternatives + 1] = alt
+        end
+    end
+    if #alternatives <= 1 then
+        return nil
+    end
+    return alternatives
+end
+
+--- Navigate an alternative-path expression.
+-- Tries each `||` candidate in order and returns the first non-nil value.
+-- Paths without `||` are passed straight through to navigate().
+-- @param root - Starting table
+-- @param path - Dot-path or alternative-path string
+-- @return value or nil
+local function navigate_any(root, path)
+    if not root or not path then return nil end
+
+    local alternatives = split_alternatives(path)
+    if not alternatives then
+        return navigate(root, path)
+    end
+
+    for _, alt in ipairs(alternatives) do
+        local value = navigate(root, alt)
+        if value ~= nil then
+            return value
+        end
+    end
+    return nil
+end
+
 --- Navigate a path and collect all values across arrays (for [].field pattern).
 -- e.g., "inventory[].quantity" collects quantity from each inventory entry
 -- @param root - Starting table
@@ -238,6 +286,29 @@ local function navigate_collect(root, path)
     return results
 end
 
+--- Navigate an alternative-path expression and collect all values across
+-- arrays ([] pattern). Tries each `||` candidate in order and returns the
+-- first candidate that yields a non-empty collection.
+-- @param root - Starting table
+-- @param path - Path with [] and/or || notation
+-- @return table - Array of collected values
+local function navigate_collect_any(root, path)
+    if not root or not path then return {} end
+
+    local alternatives = split_alternatives(path)
+    if not alternatives then
+        return navigate_collect(root, path)
+    end
+
+    for _, alt in ipairs(alternatives) do
+        local collected = navigate_collect(root, alt)
+        if #collected > 0 then
+            return collected
+        end
+    end
+    return {}
+end
+
 -- ── Transforms ────────────────────────────────────────────────────────────
 
 local transforms = {}
@@ -308,6 +379,45 @@ end
 transforms.uri_to_url = function(value)
     if type(value) ~= "string" or value == "" then return "" end
     return "https://" .. value
+end
+
+--- Ambil ELEMEN PERTAMA dari nilai gambar Lazada.
+-- Lazada mengembalikan `images` sebagai JSON-encoded string (mis.
+-- "[\"https://...\"]"), kadang sebagai array biasa, dan `skus[].Images`
+-- sebagai array. Transform ini menormalkan ketiganya menjadi satu URL string.
+-- @param value - string JSON array, array Lua, atau string URL
+-- @return string - URL pertama (atau string asli bila bukan array)
+transforms.json_first = function(value)
+    if value == nil or value == cjson.null then return nil end
+
+    if type(value) == "string" then
+        local trimmed = value:match("^%s*(.-)%s*$") or value
+        if trimmed:sub(1, 1) == "[" then
+            local ok, decoded = pcall(cjson.decode, trimmed)
+            if ok and type(decoded) == "table" and decoded[1] ~= nil then
+                local first = decoded[1]
+                if type(first) == "table" then
+                    return first.url or first.Url or first.src
+                end
+                return tostring(first)
+            end
+        end
+        if trimmed == "" then return nil end
+        return trimmed
+    end
+
+    if type(value) == "table" then
+        local first = value[1]
+        if type(first) == "table" then
+            return first.url or first.Url or first.src
+        end
+        if first ~= nil then
+            return tostring(first)
+        end
+        return nil
+    end
+
+    return nil
 end
 
 --- Map a native marketplace value → internal value via content-mapping.json.
@@ -424,7 +534,8 @@ end
 -- ── Field Resolution ──────────────────────────────────────────────────────
 
 --- Resolve a single field value from the data object.
--- Tries primary source, then fallbacks (_alt, _fallback), applies transform.
+-- Tries `||` alternatives inside `source` (first non-nil wins), then
+-- fallback fields (_alt, _fallback), applies transform.
 -- @param data - The data object (product or SKU)
 -- @param field_config - Field config table
 -- @param field_name - Field name (to find fallbacks)
@@ -447,7 +558,7 @@ local function resolve_field(data, field_config, field_name, all_field_configs, 
 
     if source then
         if is_collect then
-            local collected = navigate_collect(data, source)
+            local collected = navigate_collect_any(data, source)
             if #collected > 0 then
                 if transform_name and transforms[transform_name] then
                     value = transforms[transform_name](collected, data, field_config, marketplace)
@@ -458,7 +569,7 @@ local function resolve_field(data, field_config, field_name, all_field_configs, 
                 end
             end
         else
-            value = navigate(data, source)
+            value = navigate_any(data, source)
         end
     end
 
@@ -493,8 +604,13 @@ local function resolve_field(data, field_config, field_name, all_field_configs, 
         end
     end
 
-    -- Use default or nil
+    -- Use default or nil.
+    -- For nullable fields, an empty-string default should resolve to NULL so
+    -- the database can accept the value when upstream data is absent.
     if default ~= nil then
+        if nullable and (default == "" or default == cjson.null) then
+            return cjson.null
+        end
         return default
     end
     if nullable then
@@ -550,7 +666,7 @@ local function build_product(item, fields, sku_config, marketplace)
         end
 
         if sku_source then
-            local sku_items = navigate(item, sku_source)
+            local sku_items = navigate_any(item, sku_source)
             if sku_items and type(sku_items) == "table" and #sku_items > 0 then
                 for _, sku_data in ipairs(sku_items) do
                     skus[#skus + 1] = build_sku(sku_data, sku_fields)
@@ -568,8 +684,15 @@ local function build_product(item, fields, sku_config, marketplace)
                 -- fabricate a SKU — the product may really have variants whose
                 -- data simply failed to load, and a synthetic SKU would mislead
                 -- consumers that aggregate SKU-level stock.
-                local root_key = sku_source:match("^[^%.%[]+")
-                local source_present = root_key ~= nil and item[root_key] ~= nil
+                local source_present = false
+                local sku_sources = split_alternatives(sku_source) or { sku_source }
+                for _, src in ipairs(sku_sources) do
+                    local root_key = src:match("^[^%.%[]+")
+                    if root_key and item[root_key] ~= nil then
+                        source_present = true
+                        break
+                    end
+                end
                 if source_present then
                     local sku = build_sku(item, sku_config.fallback_fields)
                     if next(sku) then
@@ -632,12 +755,12 @@ function _M.standardize(endpoint, marketplace, enriched_json, unified_params)
         return nil
     end
 
-    -- Find product list using configured product_root
+    -- Find product list using configured product_root (supports `||` alternates)
     local product_root = mp_config.product_root
     local product_root_alt = mp_config.product_root_alt
-    local items = navigate(data, product_root)
+    local items = navigate_any(data, product_root)
     if (not items or #items == 0) and product_root_alt then
-        items = navigate(data, product_root_alt)
+        items = navigate_any(data, product_root_alt)
     end
     if not items or type(items) ~= "table" then
         items = {}
@@ -702,28 +825,40 @@ function _M.standardize(endpoint, marketplace, enriched_json, unified_params)
 
     if mp_config.pagination then
         local pag_conf = mp_config.pagination
-        local total_count = navigate(data, pag_conf.total_count)
+        local total_count = navigate_any(data, pag_conf.total_count)
         if not total_count and pag_conf.total_count_alt then
-            total_count = navigate(data, pag_conf.total_count_alt)
+            total_count = navigate_any(data, pag_conf.total_count_alt)
         end
         if not total_count then total_count = #products end
 
         local next_token = nil
         if pag_conf.next_page_token then
-            next_token = navigate(data, pag_conf.next_page_token)
+            next_token = navigate_any(data, pag_conf.next_page_token)
         end
         if not next_token and pag_conf.next_page_token_alt then
-            next_token = navigate(data, pag_conf.next_page_token_alt)
+            next_token = navigate_any(data, pag_conf.next_page_token_alt)
         end
 
         -- has_next: prefer an explicit configurable flag (e.g. Shopee's
-        -- `more` boolean on order list responses), otherwise fall back to
-        -- next_page_token presence.
+        -- `has_more` / `more` or `has_next_page` booleans), then fallback to
+        -- `next_page_token` presence, and finally infer it from `total_count`
+        -- vs current page.
         local has_next = next_token ~= nil and next_token ~= ""
+        local explicit_next = nil
         if pag_conf.has_next then
-            local explicit_next = navigate(data, pag_conf.has_next)
-            if explicit_next ~= nil then
-                has_next = explicit_next == true
+            explicit_next = navigate_any(data, pag_conf.has_next)
+        end
+        if explicit_next == nil and pag_conf.has_next_alt then
+            explicit_next = navigate_any(data, pag_conf.has_next_alt)
+        end
+        if explicit_next ~= nil then
+            has_next = explicit_next == true
+        end
+
+        if explicit_next == nil and not has_next then
+            local total_num = tonumber(total_count)
+            if total_num and page_size and page_size > 0 then
+                has_next = (page * page_size) < total_num
             end
         end
 

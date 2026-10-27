@@ -10,8 +10,11 @@
 --
 -- RESPONSE MODES:
 --   - GET /products/{id}  (product_detail):
---       Returns RAW marketplace response wrapped in { marketplace, raw_response }
---       NO normalization, NO manipulation.
+--       Default (translate=true / omitted) returns the STANDARDIZED unified
+--       response — same pipeline as GET /products (detail → synthetic
+--       single-product list → enrich (_detail / _model_raw / inventory) →
+--       standardize).  translate=false returns the RAW marketplace response
+--       wrapped in { marketplace, success, raw_response } for debugging.
 --
 --   - GET /products       (products list):
 --       Returns RAW marketplace list response, but EACH product entry gets
@@ -121,6 +124,76 @@ local function map_tiktok_error(body)
     }
 end
 
+--- Map a Lazada error response to a unified error table.
+-- Lazada selalu membalas `code`: "0" = sukses, selain itu error. Beberapa
+-- endpoint (mis. EditChoiceSkuStock) juga mengirim `success`: "true"|"false"
+-- dan `failed_sku` untuk kegagalan per-item.
+-- @param body - Decoded JSON table dari Lazada
+-- @return table|nil - { unified_code, original_code, message } atau nil
+local function map_lazada_error(body)
+    if not body or type(body) ~= "table" then
+        return nil
+    end
+
+    -- success=false eksplisit (walau code "0") tetap dianggap gagal
+    if body.success == false or body.success == "false" then
+        return {
+            unified_code  = "UNKNOWN",
+            original_code = tostring(body.error_code or "FAILED"),
+            message       = body.error_msg or body.message or "Lazada returned success=false",
+        }
+    end
+
+    local code = body.code
+    if code == nil or code == cjson.null then
+        return nil
+    end
+    if tostring(code) == "0" then
+        return nil
+    end
+
+    local lazada_map = {
+        InvalidAccessToken    = "UNAUTHORIZED",
+        IllegalAccessToken    = "UNAUTHORIZED",
+        InvalidRefreshToken   = "UNAUTHORIZED",
+        InvalidCode           = "UNAUTHORIZED",
+        -- App key / signature salah BUKAN token expired → jangan memicu
+        -- refresh token (tidak akan pernah berhasil).
+        InvalidAppKey         = "FORBIDDEN",
+        InvalidSignature      = "FORBIDDEN",
+        InsufficientPermission = "FORBIDDEN",
+        InvalidTimestamp      = "INVALID_PARAM",
+        E014                  = "INVALID_PARAM",
+        E019                  = "INVALID_PARAM",
+        E036                  = "INVALID_PARAM",
+        E901                  = "RATE_LIMITED",
+        E208                  = "NOT_FOUND",
+        E207                  = "NOT_FOUND",
+    }
+
+    local unified_code = lazada_map[tostring(code)]
+    if not unified_code then
+        local msg = tostring(body.message or body.error_msg or ""):lower()
+        if msg:find("token") or msg:find("permission") or msg:find("unauthorized") then
+            unified_code = "UNAUTHORIZED"
+        elseif msg:find("rate") or msg:find("too many") or msg:find("frequent") then
+            unified_code = "RATE_LIMITED"
+        elseif msg:find("not found") or msg:find("not exist") then
+            unified_code = "NOT_FOUND"
+        elseif msg:find("invalid") or msg:find("param") or msg:find("required") then
+            unified_code = "INVALID_PARAM"
+        else
+            unified_code = "UNKNOWN"
+        end
+    end
+
+    return {
+        unified_code  = unified_code,
+        original_code = tostring(code),
+        message       = body.message or body.error_msg or "Lazada error",
+    }
+end
+
 --- Build a unified error JSON response.
 local function build_unified_error(marketplace, status, mapped, request_id)
     local error_def = UNIFIED_ERRORS[mapped.unified_code] or UNIFIED_ERRORS.UNKNOWN
@@ -136,6 +209,162 @@ local function build_unified_error(marketplace, status, mapped, request_id)
         }
     }
 
+    local ok, json = pcall(cjson.encode, error_body)
+    if ok and json then
+        return json
+    end
+    return '{"error":{"code":"INTERNAL_ERROR","message":"failed to encode error response"}}'
+end
+
+-- ── Strict Business-Error Detection (HTTP 200 tapi isi body error) ─────
+
+--- Deteksi error "bisnis" di dalam body HTTP 200 dari marketplace.
+-- Beberapa marketplace (notabene Shopee update_stock) membalas HTTP 200
+-- walaupun operasi GAGAL per-item, mis.:
+--   { "error": "", "response": { "failure_list":
+--       [{ "model_id": 123, "failed_reason": "model ID not exist in sku" }],
+--      "success_list": [] } }
+-- Tanpa pemeriksaan ini kegagalan tersebut bocor sebagai HTTP 200 sukses.
+--
+-- Aturan STRICT: jika ada minimal SATU item gagal, seluruh request
+-- diperlakukan sebagai error (tidak ada "200 sukses sebagian").
+--
+-- @param marketplace - "shopee" or "tiktok"
+-- @param parsed - Parsed JSON body (table) dari response marketplace
+-- @return table|nil - Error info { unified_code, original_code, message,
+--           failures } jika error, atau nil jika sukses
+local function detect_business_error(marketplace, parsed)
+    if not parsed or type(parsed) ~= "table" then
+        return nil
+    end
+
+    -- ── TikTok: code ~= 0 berarti error (bisa HTTP 200) ────────────────
+    if marketplace == "tiktok" then
+        if parsed.code and parsed.code ~= 0 then
+            local mapped = map_tiktok_error(parsed)
+            if mapped then
+                return mapped
+            end
+            return {
+                unified_code  = "UNKNOWN",
+                original_code = tostring(parsed.code),
+                message       = parsed.message or "TikTok returned a business error",
+            }
+        end
+        return nil
+    end
+
+    -- ── Lazada ─────────────────────────────────────────────────────────
+    if marketplace == "lazada" then
+        local mapped = map_lazada_error(parsed)
+        if mapped then
+            return mapped
+        end
+
+        -- Kegagalan per-item EditChoiceSkuStock: failed_sku tidak kosong
+        local resp = parsed.data
+        if type(resp) == "table" and type(resp.failed_sku) == "table" and #resp.failed_sku > 0 then
+            local reasons = {}
+            for i, sku_id in ipairs(resp.failed_sku) do
+                if i > 10 then break end
+                reasons[#reasons + 1] = tostring(sku_id)
+            end
+            return {
+                unified_code  = "UNKNOWN",
+                original_code = "PARTIAL_FAILURE",
+                message       = "Lazada rejected " .. #resp.failed_sku
+                    .. " SKU(s) — failed_sku: " .. table.concat(reasons, ", "),
+                failures      = resp.failed_sku,
+                success_count = type(resp.success_sku) == "table" and #resp.success_sku or 0,
+            }
+        end
+
+        return nil
+    end
+
+    -- ── Shopee ─────────────────────────────────────────────────────────
+    if marketplace == "shopee" then
+        -- 1) Top-level error flag (error ~= "" / ~= 0)
+        local err_val = parsed.error
+        local has_top_error = false
+        if err_val ~= nil then
+            if type(err_val) == "number" then
+                has_top_error = err_val ~= 0
+            elseif type(err_val) == "string" then
+                has_top_error = err_val ~= ""
+            else
+                has_top_error = true
+            end
+        end
+        if has_top_error then
+            local err_msg = parsed.message
+            if err_msg == nil or err_msg == cjson.null or err_msg == "" then
+                err_msg = "Shopee error"
+            end
+            -- Token/otentikasi error → UNAUTHORIZED agar auto-refresh + retry
+            -- berjalan (mis. "invalid_acceess_token" dari Shopee).
+            local unified = "UNKNOWN"
+            local code_l = tostring(err_val):lower()
+            local msg_l = tostring(err_msg):lower()
+            if code_l:find("token") or code_l:find("auth")
+                or msg_l:find("token") or msg_l:find("unauthorized") then
+                unified = "UNAUTHORIZED"
+            end
+            return {
+                unified_code  = unified,
+                original_code = tostring(err_val),
+                message       = err_msg,
+            }
+        end
+
+        -- 2) Partial failures inside HTTP 200 (failure_list tidak kosong)
+        local resp = parsed.response
+        if resp == nil or resp == cjson.null or type(resp) ~= "table" then
+            resp = parsed
+        end
+        local failure_list = resp.failure_list
+        if type(failure_list) == "table" and #failure_list > 0 then
+            -- Collect human-readable reasons: "model_id: reason"
+            local reasons = {}
+            for i, f in ipairs(failure_list) do
+                if i > 10 then break end  -- cap pesan agar tidak membengkak
+                local rid = tostring(f.model_id or f.item_id or f.product_id or f.sku_id or "?")
+                local reason = f.failed_reason or f.reason or f.message or "unknown reason"
+                reasons[#reasons + 1] = rid .. ": " .. tostring(reason)
+            end
+            return {
+                unified_code  = "UNKNOWN",
+                original_code = "PARTIAL_FAILURE",
+                message       = "marketplace rejected " .. #failure_list
+                    .. " item(s) — failure_list: " .. table.concat(reasons, "; "),
+                failures      = failure_list,
+                success_count = type(resp.success_list) == "table" and #resp.success_list or 0,
+            }
+        end
+        return nil
+    end
+
+    return nil
+end
+
+--- Build error JSON untuk business error (dengan detail failures bila ada).
+local function build_business_error(marketplace, status, biz_err, request_id)
+    local error_body = {
+        error = {
+            code            = "PARTIAL_FAILURE",
+            message         = biz_err.message or "marketplace rejected the request",
+            marketplace     = marketplace,
+            original_status = status,
+            original_code   = biz_err.original_code,
+            request_id      = request_id,
+        }
+    }
+    if biz_err.failures then
+        error_body.error.failures = biz_err.failures
+    end
+    if biz_err.success_count then
+        error_body.error.success_count = biz_err.success_count
+    end
     local ok, json = pcall(cjson.encode, error_body)
     if ok and json then
         return json
@@ -210,6 +439,11 @@ local function make_marketplace_request(opts)
             if parsed_body.code and parsed_body.code ~= 0 then
                 has_business_error = true
                 mapped = map_tiktok_error(parsed_body)
+            end
+        elseif opts.marketplace == "lazada" then
+            mapped = map_lazada_error(parsed_body)
+            if mapped then
+                has_business_error = true
             end
         elseif opts.marketplace == "shopee" then
             local err_val = parsed_body.error
@@ -287,10 +521,14 @@ local function make_raw_api_call(endpoint, marketplace, unified_params, credenti
     local path = endpoint_config.path
     local method = endpoint_config.method or "GET"
 
-    -- Substitute path parameters (e.g., {product_id})
+    -- Substitute path parameters (e.g., {product_id}, {package_id})
     local pid = override_product_id or unified_params.product_id
     if pid then
         path = path:gsub("{product_id}", pid)
+    end
+    local pkg_id = unified_params.package_id or unified_params.order_id or unified_params.id or pid
+    if pkg_id then
+        path = path:gsub("{package_id}", pkg_id)
     end
 
     -- Transform unified params → marketplace-specific params
@@ -363,7 +601,7 @@ local function make_raw_api_call(endpoint, marketplace, unified_params, credenti
     })
 
     -- Make the request in RAW mode (skip error checking + normalization)
-    return make_marketplace_request({
+    local response_body, err_info = make_marketplace_request({
         full_url       = full_url,
         method         = method,
         headers        = headers,
@@ -375,6 +613,38 @@ local function make_raw_api_call(endpoint, marketplace, unified_params, credenti
         adapter        = nil,   -- no normalization
         raw            = true,  -- raw mode
     })
+
+    if not response_body then
+        return nil, err_info
+    end
+
+    -- Beberapa marketplace membalas HTTP 200 walaupun request GAGAL
+    -- (contoh Lazada: { "code": "InvalidAppKey", "message": "..." }).
+    -- RAW mode melewatkan pemeriksaan ini, jadi deteksi business error di sini
+    -- agar error tidak pernah terlihat sebagai produk/order kosong yang sukses.
+    local ok_dec, parsed_dec = pcall(cjson.decode, response_body)
+    if ok_dec and type(parsed_dec) == "table" then
+        local biz_err = detect_business_error(marketplace, parsed_dec)
+        if biz_err then
+            logger.warn("Marketplace business error inside HTTP 200", {
+                marketplace = marketplace,
+                endpoint    = endpoint,
+                code        = biz_err.original_code,
+                message     = biz_err.message,
+            })
+            return nil, {
+                unified_code  = biz_err.unified_code or "UNKNOWN",
+                message       = biz_err.message,
+                original_code = biz_err.original_code,
+                -- UNAUTHORIZED → 401 agar is_auth_failure() memicu
+                -- force-refresh + retry (error token bisa datang di HTTP 200).
+                http_status   = (biz_err.unified_code == "UNAUTHORIZED") and 401 or 200,
+                failures      = biz_err.failures,
+            }
+        end
+    end
+
+    return response_body, nil
 end
 
 -- ── Enrich List With Details ──────────────────────────────────────────────
@@ -424,6 +694,18 @@ local function enrich_list_with_details(marketplace, list_body_str, credentials,
                 product_ids[#product_ids + 1] = item.id
             end
         end
+    elseif marketplace == "lazada" then
+        -- Lazada GetProducts returns data.products[].item_id
+        local data = list_data
+        if list_data.data ~= nil and list_data.data ~= cjson.null then
+            data = list_data.data
+        end
+        local items = data.products or {}
+        for _, item in ipairs(items) do
+            if item.item_id then
+                product_ids[#product_ids + 1] = tostring(item.item_id)
+            end
+        end
     end
 
     if #product_ids == 0 then
@@ -453,21 +735,66 @@ local function enrich_list_with_details(marketplace, list_body_str, credentials,
         if detail_body then
             local ok_d, detail_data = pcall(cjson.decode, detail_body)
             if ok_d and detail_data then
-                -- Build a lookup map: item_id → full detail object
+                -- Build a lookup map: item_id → full detail object.
+                -- Shopee response shapes are inconsistent across endpoints and
+                -- tenants, so support `item_list`, `items`, `item`, and direct
+                -- array payloads. This avoids dropping `_detail` when the detail
+                -- response is wrapped differently than expected.
                 local detail_resp = detail_data.response or detail_data
-                local detail_items = detail_resp.item_list or {}
-                local detail_map = {}
-                for _, d_item in ipairs(detail_items) do
-                    detail_map[tostring(d_item.item_id)] = d_item
+                local detail_items = {}
+
+                local function append_candidate(candidate)
+                    if type(candidate) ~= "table" then
+                        return
+                    end
+
+                    if candidate[1] ~= nil then
+                        -- Array/list candidate
+                        for _, nested in ipairs(candidate) do
+                            if type(nested) == "table" then
+                                detail_items[#detail_items + 1] = nested
+                            end
+                        end
+                        return
+                    end
+
+                    -- Single object candidate
+                    if candidate.item_id ~= nil or candidate.id ~= nil or candidate.product_id ~= nil then
+                        detail_items[#detail_items + 1] = candidate
+                    end
                 end
 
-                -- Merge into list items
+                append_candidate(detail_resp.item_list)
+                append_candidate(detail_resp.items)
+                append_candidate(detail_resp.item)
+                append_candidate(detail_resp)
+                append_candidate(detail_data.item_list)
+                append_candidate(detail_data.items)
+                append_candidate(detail_data.item)
+
+                local detail_map = {}
+                for _, d_item in ipairs(detail_items) do
+                    if d_item and type(d_item) == "table" then
+                        local item_id = d_item.item_id or d_item.id or d_item.product_id
+                        if item_id ~= nil then
+                            detail_map[tostring(item_id)] = d_item
+                        end
+                    end
+                end
+
+                -- Merge into list items.
+                -- If the upstream only returns a single detail object, attach it to
+                -- the matching item when possible, otherwise keep the first item as a
+                -- safe fallback for the raw response payload.
                 local list_resp = list_data.response or list_data
-                local items = list_resp.item or {}
+                local items = list_resp.item or list_resp.items or {}
                 for _, item in ipairs(items) do
-                    local detail = detail_map[tostring(item.item_id)]
+                    local item_id = item.item_id or item.id or item.product_id
+                    local detail = detail_map[tostring(item_id)]
                     if detail then
                         item._detail = detail
+                    elseif #detail_items == 1 and not item._detail then
+                        item._detail = detail_items[1]
                     end
                 end
 
@@ -631,6 +958,67 @@ local function enrich_list_with_details(marketplace, list_body_str, credentials,
             enriched_count  = enriched_count,
             request_id      = unified_params.shop_uuid,
         })
+
+    elseif marketplace == "lazada" then
+        -- PER-PRODUCT: Lazada GetProductItem mengambil satu item_id per call.
+        local data = list_data
+        if list_data.data ~= nil and list_data.data ~= cjson.null then
+            data = list_data.data
+        end
+        local items = data.products or {}
+        local enriched_count = 0
+
+        for _, pid in ipairs(product_ids) do
+            -- Detail endpoint sudah membawa payload detail lengkap (dipakai
+            -- translate_product_detail) → jangan panggil API dua kali.
+            local already_enriched = false
+            for _, item in ipairs(items) do
+                if tostring(item.item_id or "") == pid and item._detail then
+                    already_enriched = true
+                    break
+                end
+            end
+
+            local detail_params = {
+                product_id  = pid,
+                marketplace = unified_params.marketplace,
+                shop_uuid   = unified_params.shop_uuid,
+                page        = 1,
+                page_size   = 1,
+            }
+
+            local detail_body, err
+            if not already_enriched then
+                detail_body, err = make_raw_api_call(
+                    "product_detail", "lazada", detail_params, credentials, adapter
+                )
+            end
+
+            if detail_body then
+                local ok_d, detail_data = pcall(cjson.decode, detail_body)
+                if ok_d and detail_data then
+                    for _, item in ipairs(items) do
+                        if tostring(item.item_id or "") == pid then
+                            item._detail = detail_data
+                            enriched_count = enriched_count + 1
+                            break
+                        end
+                    end
+                end
+            elseif not already_enriched then
+                logger.warn("Lazada: failed to fetch detail for product", {
+                    product_id  = pid,
+                    error       = err,
+                    request_id  = unified_params.shop_uuid,
+                })
+            end
+        end
+
+        logger.info("Lazada: enriched list with details", {
+            product_count   = #product_ids,
+            enriched_count  = enriched_count,
+            request_id      = unified_params.shop_uuid,
+        })
     end
 
     -- Re-encode the enriched response as JSON
@@ -700,6 +1088,20 @@ local function resolve_endpoint(uri, method)
     -- GET /order → "orders" (dynamic: list when no ids, detail when ids present)
     if uri == "order" and method == "GET" then
         return "orders"
+    end
+
+    -- ── Ship Order / Package / Request Pickup Endpoint ────────────────────────
+    -- POST /ship-order, /ship, /ship-package, /request-pickup, /pickup
+    if (uri == "ship-order" or uri == "ship" or uri == "ship-package"
+        or uri == "request-pickup" or uri == "pickup") and method == "POST" then
+        return "ship_order"
+    end
+
+    local ship_id = uri:match("^ship%-order/(.+)$") or uri:match("^ship/(.+)$")
+        or uri:match("^ship%-package/(.+)$") or uri:match("^request%-pickup/(.+)$")
+        or uri:match("^pickup/(.+)$")
+    if ship_id and ship_id ~= "" and method == "POST" then
+        return "ship_order", ship_id
     end
 
     return nil
@@ -774,9 +1176,9 @@ local function handle_fanout_raw(ctx, endpoint, unified_params)
                     -- Jika ada filter: single call
                     local list_body, err_info
                     if not unified_params.status or unified_params.status == "" then
-                        -- Multi-status fetch: ACTIVE + INACTIVE
+                        -- Product listing hanya mengambil status ACTIVE.
                         local merged_body = nil
-                        local statuses = { "ACTIVE", "INACTIVE" }
+                        local statuses = { "ACTIVE" }
                         for _, st in ipairs(statuses) do
                             local params = {}
                             for k, v in pairs(unified_params) do
@@ -949,6 +1351,21 @@ local function is_auth_error(marketplace, parsed_body)
                 return true
             end
         end
+    elseif marketplace == "lazada" then
+        -- Lazada error codes untuk token (code berupa string)
+        local code = tostring(parsed_body.code or "")
+        if code == "InvalidAccessToken" or code == "IllegalAccessToken"
+            or code == "InvalidRefreshToken" or code == "InvalidCode" then
+            return true
+        end
+        local msg = parsed_body.message or parsed_body.error_msg
+        if msg and type(msg) == "string" then
+            local msg_lower = msg:lower()
+            if msg_lower:find("token.*expir") or msg_lower:find("token.*invalid")
+                or msg_lower:find("illegal.*token") or msg_lower:find("unauthorized") then
+                return true
+            end
+        end
     end
 
     return false
@@ -1002,6 +1419,40 @@ end
 -- @param shop_uuid - Shop UUID (for force-refresh)
 -- @param override_product_id - (Optional) Override product_id
 -- @return string|nil, table|nil - (response_body, error_info)
+--- Parse & validate a `listing_platforms` value coming from a POST body
+-- (JSON array) or a query param (comma-separated string / repeated param).
+-- @param raw - table (array of strings) or string ("TIKTOK_SHOP,TOKOPEDIA") or nil
+-- @return table|nil, string|nil - (normalized array, error_message)
+local function parse_listing_platforms(raw)
+    if raw == nil or raw == cjson.null then
+        return nil, nil
+    end
+
+    -- Accept a single string or repeated query params (?listing_platforms=a&listing_platforms=b)
+    local parts = {}
+    if type(raw) == "table" then
+        parts = raw
+    else
+        for part in tostring(raw):gmatch("[^,]+") do
+            parts[#parts + 1] = part
+        end
+    end
+
+    -- Trim whitespace + uppercase for consistency
+    local platforms = {}
+    for _, p in ipairs(parts) do
+        p = tostring(p):gsub("^%s+", ""):gsub("%s+$", "")
+        if p ~= "" then
+            platforms[#platforms + 1] = p:upper()
+        end
+    end
+
+    if #platforms == 0 then
+        return nil, "listing_platforms must be a non-empty array (e.g. [\"TIKTOK_SHOP\"] or ?listing_platforms=TIKTOK_SHOP)"
+    end
+    return platforms, nil
+end
+
 local function make_api_call_with_retry(endpoint, marketplace, unified_params, credentials, adapter, shop_uuid, override_product_id)
     -- First attempt
     local response_body, err_info = make_raw_api_call(
@@ -1350,7 +1801,7 @@ merge_list_responses = function(marketplace, body1, body2)
         end
         return body1
 
-    elseif marketplace == "tiktok" then
+    elseif marketplace == "tiktok" or marketplace == "lazada" then
         -- Safely unwrap data wrapper (handle cjson.null)
         local d1 = data1
         if data1.data ~= nil and data1.data ~= cjson.null then
@@ -1373,9 +1824,9 @@ merge_list_responses = function(marketplace, body1, body2)
             merged_products[#merged_products + 1] = p
         end
 
-        -- Sum total_count
-        local total1 = tonumber(d1.total_count) or #products1
-        local total2 = tonumber(d2.total_count) or #products2
+        -- Sum total count (Lazada: total_products, TikTok: total_count)
+        local total1 = tonumber(d1.total_products or d1.total_count) or #products1
+        local total2 = tonumber(d2.total_products or d2.total_count) or #products2
 
         -- Build merged response
         local merged = data1  -- reuse first response table
@@ -1385,6 +1836,10 @@ merge_list_responses = function(marketplace, body1, body2)
         end
         merged_data.products = merged_products
         merged_data.total_count = total1 + total2
+        if marketplace == "lazada" then
+            merged_data.total_products = total1 + total2
+            merged_data.total_count = nil
+        end
 
         local ok_j, json = pcall(cjson.encode, merged)
         if ok_j and json then
@@ -1469,14 +1924,68 @@ local function merge_order_responses(marketplace, body1, body2)
             merged_resp = merged.response
         end
         merged_resp.order_list = merged_orders
-        merged_resp.more = resp2.more or resp1.more
-        merged_resp.next_cursor = resp2.next_cursor or resp1.next_cursor
+        -- The latest page determines whether pagination is complete. Using
+        -- `resp2.more or resp1.more` keeps true forever after page one.
+        merged_resp.more = resp2.more == true
+        merged_resp.next_cursor = resp2.next_cursor
 
         local ok_j, json = pcall(cjson.encode, merged)
         if ok_j and json then
             logger.info("Merged Shopee order lists", {
                 list1_count = #orders1,
                 list2_count = #orders2,
+            })
+            return json
+        end
+        return body1
+    end
+
+    -- Lazada format: { code, data: { count, countTotal, orders: [...] } }
+    if marketplace == "lazada" then
+        local d1 = data1
+        if data1.data ~= nil and data1.data ~= cjson.null then
+            d1 = data1.data
+        end
+        local d2 = data2
+        if data2.data ~= nil and data2.data ~= cjson.null then
+            d2 = data2.data
+        end
+
+        local orders1 = d1.orders or {}
+        local orders2 = d2.orders or {}
+
+        local merged_orders = {}
+        local seen = {}
+        for _, o in ipairs(orders1) do
+            local key = tostring(o.order_id or "")
+            if key ~= "" and not seen[key] then
+                seen[key] = true
+                merged_orders[#merged_orders + 1] = o
+            end
+        end
+        for _, o in ipairs(orders2) do
+            local key = tostring(o.order_id or "")
+            if key ~= "" and not seen[key] then
+                seen[key] = true
+                merged_orders[#merged_orders + 1] = o
+            end
+        end
+
+        local merged = data1
+        local merged_data = merged
+        if merged.data ~= nil and merged.data ~= cjson.null then
+            merged_data = merged.data
+        end
+        merged_data.orders = merged_orders
+        merged_data.count = #merged_orders
+        merged_data.countTotal = #merged_orders
+
+        local ok_j, json = pcall(cjson.encode, merged)
+        if ok_j and json then
+            logger.info("Merged Lazada order lists", {
+                list1_count = #orders1,
+                list2_count = #orders2,
+                total_count = #merged_orders,
             })
             return json
         end
@@ -1515,9 +2024,6 @@ local function merge_order_responses(marketplace, body1, body2)
         end
     end
 
-    local total1 = tonumber(d1.total_count) or #orders1
-    local total2 = tonumber(d2.total_count) or #orders2
-
     -- Build merged response (preserve the wrapper structure)
     local merged = data1
     local merged_data = merged
@@ -1525,21 +2031,101 @@ local function merge_order_responses(marketplace, body1, body2)
         merged_data = merged.data
     end
     merged_data.orders = merged_orders
-    merged_data.total_count = total1 + total2
-    -- Keep the most recent next_page_token (pagination is per-status; the
-    -- last successful call's token is the most useful for continuing).
-    merged_data.next_page_token = d2.next_page_token or d1.next_page_token
+    -- The client receives all cursor pages, so total_count is the number of
+    -- unique orders returned and no continuation token is exposed.
+    merged_data.total_count = #merged_orders
+    merged_data.next_page_token = nil
 
     local ok_j, json = pcall(cjson.encode, merged)
     if ok_j and json then
         logger.info("Merged order lists", {
             list1_count = #orders1,
             list2_count = #orders2,
-            total_count = total1 + total2,
+            total_count = #merged_orders,
         })
         return json
     end
     return body1
+end
+
+-- ── Filter Reserved Stock Response (GET /order) ─────────────────────────
+--
+-- Query opsional `product_id` / `variant_id` mengembalikan SATU produk saja
+-- (lookup reserved stock ter-target) alih-alih seluruh reserved_stock toko.
+--
+-- Filter diterapkan SETELAH status di-merge + di-aggregate (bentuk standar
+-- { marketplace, reserved_stock[], pagination }).
+--
+-- CATATAN JUJUR: marketplace TIDAK punya filter order per item/product
+-- (Shopee get_order_list & TikTok orders/search hanya menyaring order_status
+-- + rentang waktu), jadi gateway TETAP menarik order yang sama dari
+-- marketplace — yang dihemat adalah ukuran payload & kerja parsing di sisi
+-- konsumen, BUKAN jumlah panggilan ke marketplace.
+--
+-- @param body_json - JSON string hasil standardisasi /order
+-- @param product_id - Opsional: external product id (Shopee item_id / TikTok product_id)
+-- @param variant_id - Opsional: variant id (Shopee model_id / TikTok sku_id)
+-- @return string - JSON tersaring (tanpa perubahan bila tanpa filter / shape mentah)
+local function filter_reserved_stock_response(body_json, product_id, variant_id)
+    -- query param berulang (?product_id=a&product_id=b) datang sebagai table
+    if type(product_id) == "table" then product_id = product_id[1] end
+    if type(variant_id) == "table" then variant_id = variant_id[1] end
+    product_id = product_id ~= nil and tostring(product_id) or ""
+    variant_id = variant_id ~= nil and tostring(variant_id) or ""
+    if product_id == "" and variant_id == "" then
+        return body_json
+    end
+
+    local ok, data = pcall(cjson.decode, body_json)
+    if not ok or type(data) ~= "table" or type(data.reserved_stock) ~= "table" then
+        -- translate=false (response mentah marketplace) atau shape tak dikenal:
+        -- biarkan apa adanya — filter hanya berlaku untuk bentuk terstandarisasi.
+        return body_json
+    end
+
+    local kept = {}
+    for _, product in ipairs(data.reserved_stock) do
+        if type(product) == "table" then
+            local product_match = product_id == ""
+                or tostring(product.product_id or "") == product_id
+            if product_match then
+                if variant_id ~= "" then
+                    local variants = type(product.variants) == "table" and product.variants or {}
+                    local kept_variants = {}
+                    for _, variant in ipairs(variants) do
+                        if type(variant) == "table"
+                            and tostring(variant.variant_id or "") == variant_id then
+                            kept_variants[#kept_variants + 1] = variant
+                        end
+                    end
+                    if #kept_variants > 0 then
+                        product.variants = kept_variants
+                        kept[#kept + 1] = product
+                    end
+                else
+                    kept[#kept + 1] = product
+                end
+            end
+        end
+    end
+
+    if #kept == 0 then
+        -- tetap array [] (bukan {}) supaya konsumen tidak salah baca
+        kept = setmetatable({}, cjson.empty_array_mt)
+    end
+    data.reserved_stock = kept
+    data.filtered_by = {}
+    if product_id ~= "" then data.filtered_by.product_id = product_id end
+    if variant_id ~= "" then data.filtered_by.variant_id = variant_id end
+
+    -- pcall mengembalikan (ok, hasil) — urutan wajib benar:
+    -- salah urutan membuat fungsi ini mengembalikan boolean `true`
+    -- (body "true") sehingga konsumen error saat mem-parsen.
+    local encode_ok, encoded = pcall(cjson.encode, data)
+    if encode_ok and type(encoded) == "string" then
+        return encoded
+    end
+    return body_json
 end
 
 -- ── Enrich Shopee Order List With Details ─────────────────────────────────
@@ -1642,8 +2228,188 @@ local function enrich_shopee_orders_with_details(list_body, unified_params, cred
         end
     end
 
+    -- Item-level seller SKU is not consistently included in Shopee order
+    -- detail responses. Fetch it from get_item_base_info for order lines that
+    -- still have no model SKU, so products without variants retain item_sku.
+    local item_ids = {}
+    local seen_item_ids = {}
+    for _, o in ipairs(order_list) do
+        for _, li in ipairs(o.item_list or {}) do
+            local item_id = tostring(li.item_id or "")
+            local current_sku = li.model_sku or li.item_sku or o.item_sku
+            if item_id ~= "" and (not current_sku or current_sku == "")
+                and not seen_item_ids[item_id] then
+                seen_item_ids[item_id] = true
+                item_ids[#item_ids + 1] = item_id
+            end
+        end
+    end
+
+    local product_sku_map = {}
+    local SHOPEE_ITEM_SKU_BATCH = 50
+    for i = 1, #item_ids, SHOPEE_ITEM_SKU_BATCH do
+        local chunk = {}
+        local last = math.min(i + SHOPEE_ITEM_SKU_BATCH - 1, #item_ids)
+        for j = i, last do
+            chunk[#chunk + 1] = item_ids[j]
+        end
+
+        local product_params = {
+            product_id  = table.concat(chunk, ","),
+            marketplace = "shopee",
+            shop_uuid   = unified_params.shop_uuid,
+            page        = 1,
+            page_size   = #chunk,
+        }
+        local product_body, product_err = make_api_call_with_retry(
+            "product_detail", "shopee", product_params, credentials, adapter, shop_uuid
+        )
+        if product_body then
+            local ok_p, product_data = pcall(cjson.decode, product_body)
+            if ok_p and product_data then
+                local product_response = product_data.response or product_data
+                if product_data.raw_response and type(product_data.raw_response) == "table" then
+                    product_response = product_data.raw_response.response
+                        or product_data.raw_response
+                end
+
+                local product_items = {}
+                local function append_product_items(candidate)
+                    if type(candidate) ~= "table" then
+                        return
+                    end
+                    if candidate[1] ~= nil then
+                        for _, item in ipairs(candidate) do
+                            if type(item) == "table" then
+                                product_items[#product_items + 1] = item
+                            end
+                        end
+                    elseif candidate.item_id ~= nil then
+                        product_items[#product_items + 1] = candidate
+                    end
+                end
+
+                append_product_items(product_response.item_list)
+                append_product_items(product_response.items)
+                append_product_items(product_response.item)
+                append_product_items(product_response)
+                if product_data ~= product_response then
+                    append_product_items(product_data.item_list)
+                    append_product_items(product_data.items)
+                    append_product_items(product_data.item)
+                end
+
+                for _, item in ipairs(product_items) do
+                    local item_id = tostring(item.item_id or item.id or "")
+                    local item_sku = item.item_sku or item.sku
+                    if item_id ~= "" and item_sku and item_sku ~= "" then
+                        product_sku_map[item_id] = tostring(item_sku)
+                    end
+                end
+            end
+        else
+            logger.warn("Shopee: failed to fetch item_sku for order lines", {
+                count      = #chunk,
+                error      = product_err,
+                request_id = shop_uuid,
+            })
+        end
+    end
+
+    for _, o in ipairs(order_list) do
+        for _, li in ipairs(o.item_list or {}) do
+            local item_sku = product_sku_map[tostring(li.item_id or "")]
+            if item_sku and item_sku ~= "" then
+                li.item_sku = item_sku
+            end
+        end
+    end
+
     logger.info("Shopee: enriched order list with details", {
         order_count    = #order_sns,
+        enriched_count = enriched_count,
+        item_sku_count = #item_ids,
+        request_id     = shop_uuid,
+    })
+
+    local ok_j, json = pcall(cjson.encode, list_data)
+    if ok_j and json then
+        return json
+    end
+    return list_body
+end
+
+-- ── Enrich Lazada Order List With Items ──────────────────────────────────
+
+--- Lazada GetOrders hanya mengembalikan data level-order (tanpa item), jadi
+-- setiap order di-enrich dengan GetOrderItems (/order/items/get) sebelum
+-- normalisasi. Hasil item disimpan di `order._items` sehingga normalizer
+-- dapat mengagregasi reserved stock.
+--
+-- GetOrderItems hanya menerima SATU order_id per call → satu panggilan per
+-- order. Jumlah order per halaman dibatasi oleh `limit` Lazada (max 100).
+--
+-- @param list_body - Raw JSON string hasil GetOrders (sudah di-merge)
+-- @param unified_params - Unified order params (untuk konteks auth)
+-- @param credentials - Combined credentials table
+-- @param adapter - Marketplace adapter instance
+-- @param shop_uuid - Shop UUID (untuk auth auto-retry)
+-- @return string - JSON string yang sudah di-enrich
+local function enrich_lazada_orders_with_items(list_body, unified_params, credentials, adapter, shop_uuid)
+    local ok, list_data = pcall(cjson.decode, list_body)
+    if not ok or not list_data then
+        return list_body
+    end
+
+    local payload = list_data.data
+    if payload == nil or payload == cjson.null then
+        payload = list_data
+    end
+    local orders = payload.orders or {}
+    if #orders == 0 then
+        return list_body
+    end
+
+    local MAX_ORDERS = 100  -- batas limit GetOrders Lazada
+    local enriched_count = 0
+
+    for idx, order in ipairs(orders) do
+        if idx > MAX_ORDERS then break end
+
+        local order_id = tostring(order.order_id or "")
+        if order_id ~= "" then
+            local item_params = {}
+            for k, v in pairs(unified_params) do
+                item_params[k] = v
+            end
+            item_params.order_ids = order_id
+            item_params.status = nil
+
+            local item_body, err_info = make_api_call_with_retry(
+                "order_detail", "lazada", item_params, credentials, adapter, shop_uuid
+            )
+
+            if item_body then
+                local ok_i, item_data = pcall(cjson.decode, item_body)
+                if ok_i and item_data then
+                    local items = item_data.data
+                    if type(items) == "table" and items[1] ~= nil then
+                        order._items = items
+                        enriched_count = enriched_count + 1
+                    end
+                end
+            else
+                logger.warn("Lazada: order items fetch failed", {
+                    order_id   = order_id,
+                    error      = err_info,
+                    request_id = shop_uuid,
+                })
+            end
+        end
+    end
+
+    logger.info("Lazada: enriched order list with items", {
+        order_count    = #orders,
         enriched_count = enriched_count,
         request_id     = shop_uuid,
     })
@@ -1655,10 +2421,100 @@ local function enrich_shopee_orders_with_details(list_body, unified_params, cred
     return list_body
 end
 
+--- Ambil item untuk BANYAK order ID Lazada (satu call per order) lalu
+-- gabungkan menjadi satu payload { code, data: [ ...order items... ] }
+-- yang bisa diproses normalize_lazada_orders.
+--
+-- @param ids_str - Daftar order_id dipisah koma (dari ?ids=)
+-- @param order_params - Unified order params
+-- @param credentials - Combined credentials table
+-- @param adapter - Marketplace adapter instance
+-- @param shop_uuid - Shop UUID (untuk auth auto-retry)
+-- @return string|nil, table|nil - (merged_body, error_info)
+local function fetch_lazada_order_items(ids_str, order_params, credentials, adapter, shop_uuid)
+    local ids = {}
+    for part in tostring(ids_str):gmatch("[^,]+") do
+        local trimmed = part:gsub("^%s+", ""):gsub("%s+$", "")
+        if trimmed ~= "" then
+            ids[#ids + 1] = trimmed
+        end
+    end
+
+    if #ids == 0 then
+        return nil, { unified_code = "INVALID_PARAM", message = "'ids' is required (comma-separated order IDs)" }
+    end
+
+    local all_items = {}
+    local last_err = nil
+
+    for _, order_id in ipairs(ids) do
+        local params = {}
+        for k, v in pairs(order_params) do
+            params[k] = v
+        end
+        params.order_ids = order_id
+        params.status = nil
+
+        local body, err_info = make_api_call_with_retry(
+            "order_detail", "lazada", params, credentials, adapter, shop_uuid
+        )
+
+        if body then
+            local ok_p, parsed = pcall(cjson.decode, body)
+            if ok_p and parsed and type(parsed.data) == "table" then
+                for _, item in ipairs(parsed.data) do
+                    all_items[#all_items + 1] = item
+                end
+            end
+        else
+            last_err = err_info or { unified_code = "UNKNOWN", message = "failed to fetch order items" }
+        end
+    end
+
+    if #all_items == 0 and last_err then
+        return nil, last_err
+    end
+
+    local ok_j, json = pcall(cjson.encode, { code = "0", data = all_items })
+    if ok_j and json then
+        return json, nil
+    end
+    return nil, { unified_code = "INTERNAL", message = "failed to encode merged order items" }
+end
+
 -- ── Respond Helper ─────────────────────────────────────────────────────────
 
 --- Send a JSON response and terminate the request.
+--
+-- GUARD body: `ngx.say()` mencetak boolean sebagai `true`/`false`, jadi bug
+-- pipeline yang mengembalikan flag sukses `pcall` (mis. `return ok` alih-alih
+-- `return encoded`) bocor ke klien sebagai body `true` — HTTP 200 dengan
+-- payload yang bukan JSON object, dan konsumen (backend) gagal mem-parsen-nya
+-- tanpa pesan error yang jelas. Table di-encode otomatis; tipe lain dibalas
+-- 500 eksplisit agar bug terlihat (bukan tersamar sebagai response sukses).
 local function respond(status, body)
+    if type(body) ~= "string" then
+        if type(body) == "table" then
+            local ok_enc, encoded = pcall(cjson.encode, body)
+            if ok_enc and type(encoded) == "string" then
+                body = encoded
+            end
+        end
+        if type(body) ~= "string" then
+            logger.error("request-transformer: respond() menerima body non-string", {
+                body_type = type(body),
+                status    = status,
+            })
+            status = 500
+            body = cjson.encode({
+                error = {
+                    code    = "INTERNAL_ERROR",
+                    message = "plugin produced a non-JSON response body (type="
+                        .. type(body) .. ")",
+                }
+            })
+        end
+    end
     ngx.header["Content-Type"] = "application/json"
     ngx.status = status
     ngx.say(body)
@@ -1747,6 +2603,472 @@ local function reject_disallowed_fields(endpoint, marketplace, parsed_body)
     return true
 end
 
+-- ── Strict Upstream Response Helper ──────────────────────────────────────
+
+--- Balas hasil endpoint yang memanggil marketplace API (mutasi:
+-- update_stock / update_status / create_product, dan read:
+-- product_detail / inventory_search) dengan validasi error yang STRICT.
+--
+-- Aturan: TIDAK ADA error yang boleh lolos sebagai HTTP 200. Response
+-- marketplace diperiksa berlapis:
+--   1. HTTP transport error / 4xx-5xx  → UNIFIED_ERRORS mapping
+--   2. Body kosong                     → 502 UPSTREAM_ERROR
+--   3. Body non-JSON                   → 502 UPSTREAM_ERROR
+--   4. Business error di HTTP 200      → 400 PARTIAL_FAILURE
+--      (Shopee: error flag / failure_list tidak kosong — mis.
+--       "model ID not exist in sku"; TikTok: code ~= 0)
+--
+-- @param action - Nama action untuk envelope ("update_stock" dll), atau
+--        nil untuk read-endpoint (product_detail / inventory_search) yang
+--        tanpa field `action`
+-- @param marketplace - "shopee" atau "tiktok"
+-- @param response_body - Raw body string dari marketplace
+-- @param err_info - Error info dari make_api_call_with_retry (bisa nil)
+-- @param request_id - Request ID untuk tracing
+-- @param extra - (Optional) Field tambahan untuk envelope sukses
+--        (mis. { status = status } untuk update_status)
+-- @param normalize_endpoint - (Optional) Endpoint normalizer untuk sukses
+--        (mis. "create_product" agar bentuk unified { action, data } dipertahankan)
+-- @return boolean - true jika sudah di-respond (SEMUANYA error ditangani
+--          di sini; sukses pun dibalas lewat sini), false jika tidak
+--- Evaluasi hasil panggilan mutasi TANPA menulis response.
+-- Dipakai oleh respond_mutation_result (mode single) dan agregasi batch
+-- ship_order (mode array) supaya semantik sukses/error-nya identik.
+-- @return table - { ok = boolean, status = number, body = string }
+--          ok=true  → body berisi payload sukses (JSON string)
+--          ok=false → body berisi error unified (JSON string)
+local function evaluate_mutation_result(action, marketplace, response_body, err_info, request_id, extra, normalize_endpoint, normalize_params)
+    -- 1) Transport/HTTP error dari raw mode (4xx/5xx mengembalikan body
+    --    non-nil + err_info; jangan pernah dianggap sukses)
+    if err_info then
+        -- Upstream biasanya menyertakan pesan error asli di body — ekstrak
+        -- agar response error informatif, bukan hanya "HTTP 400".
+        local orig_code, orig_msg = nil, nil
+        if response_body and response_body ~= "" then
+            local ok_e, parsed_e = pcall(cjson.decode, response_body)
+            if ok_e and type(parsed_e) == "table" then
+                orig_code = parsed_e.code or parsed_e.error
+                orig_msg = parsed_e.message or parsed_e.msg or parsed_e.error_msg
+                if type(orig_code) == "table" or orig_code == cjson.null then
+                    orig_code = nil
+                end
+                if type(orig_msg) == "table" or orig_msg == cjson.null then
+                    orig_msg = nil
+                end
+            end
+        end
+        local rich_err = {
+            unified_code  = err_info.unified_code,
+            original_code = tostring(orig_code or err_info.original_code or err_info.http_status or "unknown"),
+            message       = orig_msg or err_info.message or "upstream returned an error",
+        }
+        local error_def = UNIFIED_ERRORS[rich_err.unified_code] or UNIFIED_ERRORS.UNKNOWN
+        local error_json = build_unified_error(marketplace, error_def.status, rich_err, request_id)
+        return { ok = false, status = error_def.status, body = error_json }
+    end
+
+    if not response_body or response_body == "" then
+        return {
+            ok     = false,
+            status = 502,
+            body   = '{"error":{"code":"UPSTREAM_ERROR","message":"upstream returned an empty response body"}}',
+        }
+    end
+
+    local ok_p, parsed = pcall(cjson.decode, response_body)
+    if not ok_p or not parsed or type(parsed) ~= "table" then
+        return {
+            ok     = false,
+            status = 502,
+            body   = cjson.encode({
+                error = {
+                    code = "UPSTREAM_ERROR",
+                    message = "upstream returned a non-JSON response body",
+                    marketplace = marketplace,
+                    request_id = request_id,
+                }
+            }),
+        }
+    end
+
+    -- 2) Business error di dalam HTTP 200 (Shopee failure_list / TikTok code)
+    local biz_err = detect_business_error(marketplace, parsed)
+    if biz_err then
+        return {
+            ok     = false,
+            status = 400,
+            body   = build_business_error(marketplace, 400, biz_err, request_id),
+        }
+    end
+
+    -- 3) SUKSES — bungkus raw response dengan marketplace info
+    -- Normalizer opsional (create_product): pertahankan bentuk unified
+    -- { marketplace, action, success, data } seperti sebelumnya. Business
+    -- error sudah difilter di atas, jadi normalizer tidak akan return nil
+    -- karena error — hanya karena kegagalan encode/parse.
+    if normalize_endpoint then
+        local normalized = response_mapping.normalize(
+            normalize_endpoint, marketplace, response_body,
+            normalize_params or extra or {}
+        )
+        if normalized then
+            return { ok = true, status = 200, body = normalized }
+        end
+    end
+
+    local wrapped = {
+        marketplace  = marketplace,
+        success      = true,
+        raw_response = parsed,
+    }
+    if action then
+        wrapped.action = action
+    end
+    if extra then
+        for k, v in pairs(extra) do
+            if wrapped[k] == nil then
+                wrapped[k] = v
+            end
+        end
+    end
+    local ok_j, json = pcall(cjson.encode, wrapped)
+    if ok_j and json then
+        return { ok = true, status = 200, body = json }
+    end
+
+    -- Encode gagal — jangan pernah balas 200 dengan payload korup
+    return {
+        ok     = false,
+        status = 500,
+        body   = '{"error":{"code":"INTERNAL_ERROR","message":"failed to encode marketplace response"}}',
+    }
+end
+
+--- Balas hasil mutasi (mode single): evaluasi lalu kirim apa adanya.
+local function respond_mutation_result(action, marketplace, response_body, err_info, request_id, extra, normalize_endpoint, normalize_params)
+    local result = evaluate_mutation_result(
+        action, marketplace, response_body, err_info, request_id,
+        extra, normalize_endpoint, normalize_params
+    )
+    respond(result.status, result.body)
+    return true
+end
+
+-- ── Ship Order Batch & Scanning Helpers ────────────────────────────────
+-- /ship-order menerima SATU id ataupun ARRAY id (batching). Untuk setiap
+-- order, gateway melakukan SCANNING ke GET order detail agar field native
+-- yang diwajibkan marketplace tersedia:
+--   TikTok : package_id  (data.orders[].packages[].id)
+--   Shopee : package_number (response.order_list[].package_list[].package_number)
+-- Semua paket yang ditemukan dikirim satu per satu, lalu hasilnya diagregasi.
+
+--- Tambahkan satu nilai id (string, "A,B", atau array) ke daftar id.
+local function append_order_ids(list, value)
+    if value == nil or value == cjson.null then
+        return
+    end
+    if type(value) == "table" then
+        for _, item in ipairs(value) do
+            append_order_ids(list, item)
+        end
+        return
+    end
+
+    local text = tostring(value):gsub("^%s+", ""):gsub("%s+$", "")
+    if text == "" then
+        return
+    end
+
+    if text:find(",", 1, true) then
+        for part in text:gmatch("[^,]+") do
+            local trimmed = part:gsub("^%s+", ""):gsub("%s+$", "")
+            if trimmed ~= "" then
+                list[#list + 1] = trimmed
+            end
+        end
+    else
+        list[#list + 1] = text
+    end
+end
+
+--- Kumpulkan order id unik (urutan dipertahankan) dari path, query, dan body.
+-- @param path_id - ID dari URL path (/ship-order/{id}), boleh "id1,id2"
+-- @param args - Query params
+-- @param parsed_body - Request body terparse
+-- @return table - Array id unik
+local function collect_ship_order_ids(path_id, args, parsed_body)
+    local collected = {}
+
+    append_order_ids(collected, path_id)
+    for _, key in ipairs({ "ids", "order_ids", "order_id", "order_sn", "package_id" }) do
+        append_order_ids(collected, args and args[key])
+    end
+    for _, key in ipairs({ "order_id", "order_ids", "order_sn", "package_id" }) do
+        append_order_ids(collected, parsed_body and parsed_body[key])
+    end
+
+    local unique, seen = {}, {}
+    for _, id in ipairs(collected) do
+        if not seen[id] then
+            seen[id] = true
+            unique[#unique + 1] = id
+        end
+    end
+    return unique
+end
+
+--- Simpan package native hasil scan (tanpa duplikat).
+local function add_scanned_package(scan_map, order_id, package_id)
+    local entry = scan_map[order_id]
+    if not entry then
+        entry = { packages = {} }
+        scan_map[order_id] = entry
+    end
+
+    local text = tostring(package_id or "")
+    if text == "" then
+        return
+    end
+    for _, existing in ipairs(entry.packages) do
+        if existing == text then
+            return
+        end
+    end
+    entry.packages[#entry.packages + 1] = text
+end
+
+--- Baca package native dari raw response GET order detail.
+local function extract_scanned_packages(marketplace, parsed, scan_map)
+    if marketplace == "tiktok" then
+        local resp = type(parsed.data) == "table" and parsed.data or parsed
+        for _, order in ipairs(resp.orders or {}) do
+            local order_id = tostring(order.id or order.order_id or "")
+            if order_id ~= "" then
+                local before = scan_map[order_id] and #scan_map[order_id].packages or 0
+                for _, package in ipairs(order.packages or {}) do
+                    add_scanned_package(scan_map, order_id, package.id)
+                end
+                local after = scan_map[order_id] and #scan_map[order_id].packages or 0
+                -- Sebagian response hanya menyertakan package_id di line_items.
+                if after == before then
+                    for _, line_item in ipairs(order.line_items or {}) do
+                        add_scanned_package(scan_map, order_id, line_item.package_id)
+                    end
+                end
+            end
+        end
+
+    elseif marketplace == "shopee" then
+        local resp = type(parsed.response) == "table" and parsed.response or parsed
+        for _, order in ipairs(resp.order_list or {}) do
+            local order_id = tostring(order.order_sn or "")
+            if order_id ~= "" then
+                for _, package in ipairs(order.package_list or {}) do
+                    add_scanned_package(scan_map, order_id, package.package_number)
+                end
+            end
+        end
+    end
+
+    return scan_map
+end
+
+--- SCANNING: ambil package native setiap order via GET order detail.
+-- Dikirim maksimal 50 id per panggilan (batas marketplace) — namun batch
+-- ship_order sendiri dibatasi `options.max_batch_size` sehingga normalnya
+-- hanya satu panggilan.
+-- @return table - map[order_id] = { packages = { "pkg1", ... } }
+local SHIP_ORDER_SCAN_BATCH_SIZE = 50
+local function scan_order_packages(marketplace, order_ids, credentials, ctx, shop_uuid)
+    local scan_map = {}
+
+    for start = 1, #order_ids, SHIP_ORDER_SCAN_BATCH_SIZE do
+        local chunk = {}
+        local last = math.min(start + SHIP_ORDER_SCAN_BATCH_SIZE - 1, #order_ids)
+        for i = start, last do
+            chunk[#chunk + 1] = order_ids[i]
+        end
+
+        local scan_params = {
+            marketplace = marketplace,
+            shop_uuid   = shop_uuid,
+            order_ids   = table.concat(chunk, ","),
+            page_size   = #chunk,
+        }
+        local scan_body, scan_err = make_api_call_with_retry(
+            "order_detail", marketplace, scan_params, credentials, ctx.adapter, ctx.shop_uuid
+        )
+
+        local parsed = nil
+        if scan_body then
+            local ok_dec, decoded = pcall(cjson.decode, scan_body)
+            if ok_dec and type(decoded) == "table" then
+                parsed = decoded
+            end
+        end
+
+        if not parsed then
+            logger.warn("Ship order: order detail scan failed", {
+                marketplace = marketplace,
+                order_ids   = table.concat(chunk, ","),
+                error       = (scan_err and (scan_err.message or scan_err.unified_code))
+                    or "unparseable response",
+                request_id  = ctx.request_id,
+            })
+        else
+            extract_scanned_packages(marketplace, parsed, scan_map)
+        end
+    end
+
+    return scan_map
+end
+
+-- ── Product Detail → translated (unified) response ────────────────────────
+
+--- Bungkus payload DETAIL satu product menjadi bentuk daftar tunggal.
+--
+-- Endpoint detail memakai API marketplace yang bentuknya BERBEDA dari
+-- endpoint list (Shopee ``get_item_base_info`` → ``response.item_list``;
+-- TikTok Get Product → ``data.product``), sedangkan standardizer
+-- (standardization-config.json) membaca ``product_root``
+-- ``response.item`` / ``data.products``. Karena itu payload detail dibungkus
+-- jadi daftar berisi SATU product dengan key yang sama, sehingga pipeline
+-- ENRICH + STANDARDIZE milik ``GET /products`` bisa dipakai ulang apa adanya.
+--
+-- @param marketplace - "shopee" atau "tiktok"
+-- @param raw_body - Raw JSON string dari marketplace
+-- @return string|nil - JSON string daftar tunggal, atau nil bila payload
+--                       tidak dikenal (caller jatuh ke mode raw).
+local function build_product_detail_list_body(marketplace, raw_body)
+    local ok, data = pcall(cjson.decode, raw_body)
+    if not ok or type(data) ~= "table" then
+        return nil
+    end
+
+    local items = nil
+    local wrapped = nil
+
+    if marketplace == "shopee" then
+        local resp = data
+        if type(data.response) == "table" then
+            resp = data.response
+        end
+        if type(resp.item_list) == "table" and #resp.item_list > 0 then
+            items = resp.item_list
+        elseif type(resp.item) == "table" then
+            if resp.item[1] ~= nil then
+                items = resp.item
+            elseif resp.item.item_id ~= nil then
+                items = { resp.item }
+            end
+        elseif resp.item_id ~= nil then
+            -- Payload detail tanpa pembungkus `response` (item langsung di
+            -- root object) — tetap bisa di-wrap jadi daftar tunggal.
+            items = { resp }
+        end
+        if not items or #items == 0 then
+            return nil
+        end
+        wrapped = {
+            response = {
+                item        = items,
+                total_count = #items,
+                has_more    = false,
+            },
+        }
+    elseif marketplace == "tiktok" then
+        local resp = data
+        if type(data.data) == "table" then
+            resp = data.data
+        end
+        if type(resp.products) == "table" and #resp.products > 0 then
+            items = resp.products
+        elseif type(resp.product) == "table" and next(resp.product) ~= nil then
+            items = { resp.product }
+        elseif type(resp.item) == "table" and next(resp.item) ~= nil then
+            items = { resp.item }
+        elseif resp.id ~= nil then
+            items = { resp }
+        end
+        if not items or #items == 0 then
+            return nil
+        end
+        wrapped = {
+            data = {
+                products    = items,
+                total_count = #items,
+            },
+        }
+    elseif marketplace == "lazada" then
+        -- Lazada GetProductItem: { code: "0", data: { item_id, skus, ... } }
+        local resp = data
+        if type(data.data) == "table" then
+            resp = data.data
+        end
+        if type(resp.products) == "table" and #resp.products > 0 then
+            items = resp.products
+        elseif type(resp) == "table" and (resp.item_id ~= nil or resp.skus ~= nil) then
+            items = { resp }
+        end
+        if not items or #items == 0 then
+            return nil
+        end
+        wrapped = {
+            code = "0",
+            data = {
+                products       = items,
+                total_products = #items,
+            },
+        }
+    else
+        return nil
+    end
+
+    local ok_e, encoded = pcall(cjson.encode, wrapped)
+    if ok_e and encoded then
+        return encoded
+    end
+    return nil
+end
+
+--- Terjemahkan payload product detail ke skema unified standar.
+--
+-- Jalur yang sama dengan ``GET /products``: enrich (detail / model_list /
+-- inventory) → ``response_mapping.standardize("products", …)``.
+--
+-- @return translated|nil, std_err|nil
+--   • ``translated`` non-nil → balas 200 dengan payload terjemahan.
+--   • ``std_err`` non-nil    → validasi standardisasi gagal → balas error.
+--   • keduanya nil           → payload tak dikenal → caller jatuh ke mode raw.
+local function translate_product_detail(
+    marketplace, raw_body, credentials, adapter, unified_params
+)
+    local list_body = build_product_detail_list_body(marketplace, raw_body)
+    if not list_body then
+        return nil, nil
+    end
+
+    local enriched = enrich_list_with_details(
+        marketplace, list_body, credentials, adapter, unified_params
+    )
+    if marketplace == "tiktok" and enriched then
+        enriched = enrich_list_with_inventory(
+            enriched, credentials, adapter, unified_params
+        )
+    end
+    if not enriched then
+        return nil, nil
+    end
+
+    local standardized, std_err = response_mapping.standardize(
+        "products", marketplace, enriched, unified_params
+    )
+    if std_err then
+        return nil, std_err
+    end
+    return standardized, nil
+end
+
 -- ── Plugin Entry Point ─────────────────────────────────────────────────────
 
 function _M.check_schema(conf, schema_type)
@@ -1769,7 +3091,7 @@ function _M.access(conf, ctx)
     -- Parse incoming query parameters
     local args = ngx.req.get_uri_args()
     local product_id = args.product_id or uri_product_id
-    local marketplace = ctx.marketplace or ""
+    local marketplace = ctx.marketplace or args.marketplace or ""
 
     -- ── MUTATION ENDPOINTS: marketplace=all DITOLAK (guard dini) ────────
     -- update_status / update_stock / create_product adalah mutasi per-shop,
@@ -1779,11 +3101,11 @@ function _M.access(conf, ctx)
     -- jadi ctx.all_shops/ctx.adapter nil dan tanpa guard ini request akan
     -- jatuh ke NO_ADAPTER (500). Guard dini menjegal dengan 400 yang bersih.
     if marketplace == "all" then
-        if endpoint == "update_status" or endpoint == "update_stock" or endpoint == "create_product" then
+        if endpoint == "update_status" or endpoint == "update_stock" or endpoint == "create_product" or endpoint == "ship_order" then
             -- Pakai format hyphen (sama dengan handler lama: "update-status",
             -- "update-stock") agar pesan error konsisten di seluruh gateway.
             local display = endpoint:gsub("_", "-")
-            respond(400, '{"error":{"code":"INVALID_MARKETPLACE","message":"' .. display .. ' does not support marketplace=all; specify shopee or tiktok"}}')
+            respond(400, '{"error":{"code":"INVALID_MARKETPLACE","message":"' .. display .. ' does not support marketplace=all; specify shopee, tiktok, or lazada"}}')
             return
         end
     end
@@ -1795,7 +3117,7 @@ function _M.access(conf, ctx)
     -- diperiksa di handler-nya karena TikTok perlu endpoint efektif
     -- (activate_products / deactivate_products) dari body status.
     if marketplace ~= "" and marketplace ~= "all" then
-        if endpoint == "create_product" or endpoint == "update_stock" then
+        if endpoint == "create_product" or endpoint == "update_stock" or endpoint == "ship_order" then
             local allowed, disabled_ep = guard_endpoint_enabled(endpoint, marketplace)
             if not allowed then
                 respond_endpoint_disabled(disabled_ep)
@@ -1820,9 +3142,18 @@ function _M.access(conf, ctx)
         translate = not (t == "false" or t == "0" or t == "no")
     end
 
+    -- site: kode negara Lazada (SG/MY/ID/PH/TH/VN). Dipakai update-stock
+    -- (EditChoiceSkuStock mewajibkan `site`). Query param berbentuk
+    -- ?site=SG; nilai berulang diambil yang pertama.
+    local site_arg = args.site
+    if type(site_arg) == "table" then
+        site_arg = site_arg[1]
+    end
+
     local unified_params = {
         marketplace = marketplace,
         shop_uuid   = ctx.shop_uuid,
+        site        = site_arg,
         page        = tonumber(args.page) or 1,
         page_size   = tonumber(args.page_size) or 50,
         keyword     = args.keyword,
@@ -1835,6 +3166,18 @@ function _M.access(conf, ctx)
         -- `page_token` by parameter-mapping.tiktok_product_list.
         next_page_token = args.next_page_token or args.page_token,
     }
+
+    -- listing_platforms (TikTok product search filter) via query param —
+    -- comma-separated string or repeated param. Also settable via POST body
+    -- (see "products" + "inventory_search" endpoint handling below).
+    if args.listing_platforms then
+        local platforms, lp_err = parse_listing_platforms(args.listing_platforms)
+        if lp_err then
+            respond(400, cjson.encode({ error = { code = "INVALID_LISTING_PLATFORMS", message = lp_err } }))
+            return
+        end
+        unified_params.listing_platforms = platforms
+    end
 
     -- ── Validasi status filter (GET products) ─────────────────────────────
     -- Status yang tidak dikenal sebaiknya ditolak dengan INVALID_STATUS,
@@ -1908,6 +3251,22 @@ function _M.access(conf, ctx)
     -- POST /products with body containing "product_ids" or "sku_ids"
     -- automatically routes to inventory_search (TikTok only).
     -- This eliminates the need for a separate /inventory-search endpoint.
+    --
+    -- POST /products WITHOUT product_ids/sku_ids stays a Product Search
+    -- (TikTok Search Products API). Additional TikTok search filters in the
+    -- body (e.g. listing_platforms) are merged into unified_params so the
+    -- TikTok body builder can forward them to the marketplace API.
+    if endpoint == "products" and method == "POST" and marketplace == "lazada" then
+        -- Lazada memakai GET /products/get; tidak ada endpoint POST /products.
+        respond(400, cjson.encode({
+            error = {
+                code = "ENDPOINT_NOT_SUPPORTED",
+                message = "POST /products is not supported for marketplace 'lazada' — use GET /products",
+            }
+        }))
+        return
+    end
+
     if endpoint == "products" and method == "POST" then
         ngx.req.read_body()
         local body_data = ngx.req.get_body_data()
@@ -1917,6 +3276,16 @@ function _M.access(conf, ctx)
                 if parsed_body.product_ids or parsed_body.sku_ids then
                     -- Body contains inventory search params → route to inventory_search
                     endpoint = "inventory_search"
+                elseif marketplace == "tiktok" then
+                    -- Product Search filters (TikTok only)
+                    local platforms, lp_err = parse_listing_platforms(parsed_body.listing_platforms)
+                    if lp_err then
+                        respond(400, cjson.encode({ error = { code = "INVALID_LISTING_PLATFORMS", message = lp_err } }))
+                        return
+                    end
+                    if platforms then
+                        unified_params.listing_platforms = platforms
+                    end
                 end
             end
         end
@@ -1993,9 +3362,18 @@ function _M.access(conf, ctx)
 
         -- ── DETAIL MODE: ids provided → Get Order Detail ──────────────────
         if ids_arg and ids_arg ~= "" then
-            local detail_body, err_info = make_api_call_with_retry(
-                "order_detail", marketplace, order_params, credentials, ctx.adapter, ctx.shop_uuid
-            )
+            -- Lazada GetOrderItems hanya menerima SATU order_id per call →
+            -- loop untuk setiap ID lalu gabungkan item-nya.
+            local detail_body, err_info
+            if marketplace == "lazada" then
+                detail_body, err_info = fetch_lazada_order_items(
+                    ids_arg, order_params, credentials, ctx.adapter, ctx.shop_uuid
+                )
+            else
+                detail_body, err_info = make_api_call_with_retry(
+                    "order_detail", marketplace, order_params, credentials, ctx.adapter, ctx.shop_uuid
+                )
+            end
 
             if not detail_body then
                 local error_def = UNIFIED_ERRORS[err_info.unified_code] or UNIFIED_ERRORS.UNKNOWN
@@ -2028,6 +3406,10 @@ function _M.access(conf, ctx)
                 end
             end
 
+            -- Filter ter-target (opsional): ?product_id= / ?variant_id=
+            final_body = filter_reserved_stock_response(
+                final_body, args.product_id, args.variant_id
+            )
             respond(200, final_body)
             return
         end
@@ -2041,6 +3423,8 @@ function _M.access(conf, ctx)
         local DEFAULT_ORDER_STATUSES = {
             tiktok = { "UNPAID", "ON_HOLD", "AWAITING_SHIPMENT" },
             shopee = { "UNPAID", "READY_TO_SHIP" },
+            -- Lazada memakai status native huruf kecil
+            lazada = { "unpaid", "ready_to_ship" },
         }
 
         local statuses_to_fetch = {}
@@ -2052,35 +3436,106 @@ function _M.access(conf, ctx)
 
         local merged_body = nil
         local any_success = false
+        local last_order_err = nil
         for _, fetch_status in ipairs(statuses_to_fetch) do
-            local params = {}
-            for k, v in pairs(order_params) do
-                params[k] = v
-            end
-            params.status = fetch_status
+            local next_cursor = order_params.next_page_token
+            local has_more = true
+            local seen_cursors = {}
 
-            local list_body, err_info = make_api_call_with_retry(
-                "orders", marketplace, params, credentials, ctx.adapter, ctx.shop_uuid
-            )
-
-            if list_body then
-                if merged_body then
-                    merged_body = merge_order_responses(marketplace, merged_body, list_body)
-                else
-                    merged_body = list_body
+            while has_more do
+                local params = {}
+                for k, v in pairs(order_params) do
+                    params[k] = v
                 end
-                any_success = true
-            else
-                logger.warn("Orders: failed to fetch for status", {
-                    status      = fetch_status,
-                    marketplace = marketplace,
-                    error       = err_info,
-                    request_id  = ctx.request_id,
-                })
+                params.status = fetch_status
+                params.next_page_token = next_cursor
+
+                local list_body, err_info = make_api_call_with_retry(
+                    "orders", marketplace, params, credentials, ctx.adapter, ctx.shop_uuid
+                )
+
+                if list_body then
+                    if merged_body then
+                        merged_body = merge_order_responses(marketplace, merged_body, list_body)
+                    else
+                        merged_body = list_body
+                    end
+                    any_success = true
+
+                    if marketplace == "shopee" then
+                        local ok_page, page_data = pcall(cjson.decode, list_body)
+                        local page_response = ok_page and page_data or {}
+                        if page_response.response ~= nil and page_response.response ~= cjson.null then
+                            page_response = page_response.response
+                        end
+                        has_more = page_response.more == true
+                        local page_cursor = page_response.next_cursor
+                        if page_cursor == cjson.null then page_cursor = nil end
+                        if has_more and (not page_cursor or tostring(page_cursor) == "") then
+                            logger.warn("Shopee: pagination stopped without next_cursor", {
+                                status     = fetch_status,
+                                request_id = ctx.request_id,
+                            })
+                            has_more = false
+                        elseif has_more and seen_cursors[tostring(page_cursor)] then
+                            logger.warn("Shopee: repeated next_cursor, stopping pagination", {
+                                status     = fetch_status,
+                                request_id = ctx.request_id,
+                            })
+                            has_more = false
+                        else
+                            if page_cursor then
+                                seen_cursors[tostring(page_cursor)] = true
+                            end
+                            next_cursor = page_cursor
+                        end
+                    else
+                        -- TikTok uses next_page_token for cursor pagination.
+                        local ok_page, page_data = pcall(cjson.decode, list_body)
+                        local page_response = ok_page and page_data or {}
+                        if page_response.data ~= nil and page_response.data ~= cjson.null then
+                            page_response = page_response.data
+                        end
+                        local page_token = page_response.next_page_token
+                        if page_token == cjson.null then page_token = nil end
+                        if page_token and tostring(page_token) ~= "" then
+                            local token_key = tostring(page_token)
+                            if seen_cursors[token_key] then
+                                logger.warn("TikTok: repeated next_page_token, stopping pagination", {
+                                    status     = fetch_status,
+                                    request_id = ctx.request_id,
+                                })
+                                has_more = false
+                            else
+                                seen_cursors[token_key] = true
+                                next_cursor = page_token
+                                has_more = true
+                            end
+                        else
+                            has_more = false
+                        end
+                    end
+                else
+                    last_order_err = err_info
+                    logger.warn("Orders: failed to fetch for status", {
+                        status      = fetch_status,
+                        marketplace = marketplace,
+                        error       = err_info,
+                        request_id  = ctx.request_id,
+                    })
+                    has_more = false
+                end
             end
         end
 
         if not any_success or not merged_body then
+            if last_order_err and last_order_err.message then
+                local error_def = UNIFIED_ERRORS[last_order_err.unified_code] or UNIFIED_ERRORS.UNKNOWN
+                respond(error_def.status, build_unified_error(
+                    marketplace, error_def.status, last_order_err, ctx.request_id
+                ))
+                return
+            end
             respond(502, '{"error":{"code":"UPSTREAM_ERROR","message":"failed to fetch orders from marketplace"}}')
             return
         end
@@ -2091,6 +3546,12 @@ function _M.access(conf, ctx)
         -- already carries the full order objects.
         if marketplace == "shopee" then
             merged_body = enrich_shopee_orders_with_details(
+                merged_body, order_params, credentials, ctx.adapter, ctx.shop_uuid
+            )
+        elseif marketplace == "lazada" then
+            -- GetOrders tidak menyertakan line item → enrich dengan GetOrderItems
+            -- agar reserved stock bisa dihitung.
+            merged_body = enrich_lazada_orders_with_items(
                 merged_body, order_params, credentials, ctx.adapter, ctx.shop_uuid
             )
         end
@@ -2119,42 +3580,66 @@ function _M.access(conf, ctx)
             end
         end
 
+        -- Filter ter-target (opsional): ?product_id= / ?variant_id=
+        -- hanya berlaku untuk bentuk terstandarisasi (translate=true).
+        final_body = filter_reserved_stock_response(
+            final_body, args.product_id, args.variant_id
+        )
         respond(200, final_body)
         return
     end
 
     -- ── PRODUCT DETAIL ENDPOINT (/products/{id}) ──────────────────────────
-    -- Return RAW marketplace response wrapped with marketplace info.
-    -- NO normalization, NO manipulation.
-    -- Auto-retries if marketplace returns an auth error (invalid/expired token).
+    -- translate=true (default): payload detail marketplace DI-TERJEMAHKAN ke
+    -- skema unified standar — pipeline ENRICH + STANDARDIZE yang SAMA dengan
+    -- GET /products, sehingga konsumen (parser backend) mendapat bentuk yang
+    -- identik untuk list maupun detail.
+    -- translate=false: RAW marketplace response (perilaku lama, untuk debug).
     if endpoint == "product_detail" then
         local response_body, err_info = make_api_call_with_retry(
             endpoint, marketplace, unified_params, credentials, ctx.adapter, ctx.shop_uuid
         )
 
-        if not response_body then
-            local error_def = UNIFIED_ERRORS[err_info.unified_code] or UNIFIED_ERRORS.UNKNOWN
-            local error_json = build_unified_error(marketplace, error_def.status, err_info, ctx.request_id)
-            respond(error_def.status, error_json)
+        -- STRICT: semua error — transport, HTTP 4xx/5xx, business error di
+        -- HTTP 200 (Shopee error flag, TikTok code ~= 0), body kosong/non-JSON
+        -- — dibalas sebagai HTTP error yang benar. Error TIDAK diterjemahkan.
+        if err_info then
+            respond_mutation_result(nil, marketplace, response_body, err_info, ctx.request_id)
             return
         end
 
-        -- Parse raw body and wrap with marketplace info
-        local ok_p, parsed = pcall(cjson.decode, response_body)
-        if ok_p and parsed then
-            local wrapped = {
-                marketplace   = marketplace,
-                raw_response  = parsed,
-            }
-            local ok_j, json = pcall(cjson.encode, wrapped)
-            if ok_j then
-                respond(200, json)
-                return
+        if translate ~= false and response_body and response_body ~= "" then
+            -- Validasi error bisnis dulu (Shopee failure_list / TikTok code)
+            -- supaya payload error tidak pernah lolos sebagai produk sukses.
+            local ok_b, parsed_b = pcall(cjson.decode, response_body)
+            local is_business_ok = ok_b and type(parsed_b) == "table"
+                and not detect_business_error(marketplace, parsed_b)
+
+            if is_business_ok then
+                local translated, std_err = translate_product_detail(
+                    marketplace, response_body,
+                    ctx.shop_credentials or credentials,
+                    ctx.adapter, unified_params
+                )
+                if std_err then
+                    respond_standardization_error(std_err)
+                    return
+                end
+                if translated then
+                    respond(200, translated)
+                    return
+                end
+                -- Payload tak dikenal → jatuh ke mode raw di bawah (lebih
+                -- baik data mentah daripada 500 kosong).
+                logger.warn("Product detail: gagal terjemahkan, fallback raw", {
+                    marketplace = marketplace,
+                    product_id  = unified_params.product_id,
+                    request_id  = ctx.request_id,
+                })
             end
         end
 
-        -- Fallback: return raw body if JSON wrapping fails
-        respond(200, response_body)
+        respond_mutation_result(nil, marketplace, response_body, err_info, ctx.request_id)
         return
     end
 
@@ -2190,29 +3675,10 @@ function _M.access(conf, ctx)
             endpoint, marketplace, unified_params, credentials, ctx.adapter, ctx.shop_uuid
         )
 
-        if not response_body then
-            local error_def = UNIFIED_ERRORS[err_info.unified_code] or UNIFIED_ERRORS.UNKNOWN
-            local error_json = build_unified_error(marketplace, error_def.status, err_info, ctx.request_id)
-            respond(error_def.status, error_json)
-            return
-        end
-
-        -- Parse raw body and wrap with marketplace info
-        local ok_p, parsed = pcall(cjson.decode, response_body)
-        if ok_p and parsed then
-            local wrapped = {
-                marketplace   = marketplace,
-                raw_response  = parsed,
-            }
-            local ok_j, json = pcall(cjson.encode, wrapped)
-            if ok_j then
-                respond(200, json)
-                return
-            end
-        end
-
-        -- Fallback: return raw body if JSON wrapping fails
-        respond(200, response_body)
+        -- STRICT: semua error — transport, HTTP 4xx/5xx, business error di
+        -- HTTP 200 (TikTok code ~= 0), body kosong/non-JSON — dibalas
+        -- sebagai HTTP error yang benar.
+        respond_mutation_result(nil, marketplace, response_body, err_info, ctx.request_id)
         return
     end
 
@@ -2239,7 +3705,7 @@ function _M.access(conf, ctx)
     if endpoint == "update_stock" then
         -- Defensive: update_stock is a per-shop mutation, fan-out is not allowed.
         if marketplace == "all" then
-            respond(400, '{"error":{"code":"INVALID_MARKETPLACE","message":"update-stock does not support marketplace=all; specify shopee or tiktok"}}')
+            respond(400, '{"error":{"code":"INVALID_MARKETPLACE","message":"update-stock does not support marketplace=all; specify shopee, tiktok, or lazada"}}')
             return
         end
 
@@ -2385,34 +3851,32 @@ function _M.access(conf, ctx)
             return
         end
 
+        -- Lazada EditChoiceSkuStock mewajibkan `site` (kode negara).
+        -- Nilai diambil dari body { "site": "SG" } atau query ?site=SG.
+        if marketplace == "lazada" then
+            local site = parsed_body.site or unified_params.site
+            if site == nil or site == "" then
+                respond(400, cjson.encode({
+                    error = {
+                        code = "MISSING_SITE",
+                        message = "'site' is required for Lazada update-stock (SG/MY/ID/PH/TH/VN) — provide in body or query",
+                    }
+                }))
+                return
+            end
+            unified_params.site = tostring(site):upper()
+        end
+
         -- Call marketplace API in RAW mode (auto-retry on auth error)
         local response_body, err_info = make_api_call_with_retry(
             endpoint, marketplace, unified_params, credentials, ctx.adapter, ctx.shop_uuid
         )
 
-        if not response_body then
-            local error_def = UNIFIED_ERRORS[err_info.unified_code] or UNIFIED_ERRORS.UNKNOWN
-            local error_json = build_unified_error(marketplace, error_def.status, err_info, ctx.request_id)
-            respond(error_def.status, error_json)
-            return
-        end
-
-        -- Parse raw body and wrap with marketplace info
-        local ok_p, parsed = pcall(cjson.decode, response_body)
-        if ok_p and parsed then
-            local wrapped = {
-                marketplace   = marketplace,
-                raw_response  = parsed,
-            }
-            local ok_j, json = pcall(cjson.encode, wrapped)
-            if ok_j then
-                respond(200, json)
-                return
-            end
-        end
-
-        -- Fallback: return raw body if JSON wrapping fails
-        respond(200, response_body)
+        -- STRICT: semua error — transport, HTTP 4xx/5xx, business error di
+        -- HTTP 200 (mis. Shopee failure_list "model ID not exist in sku",
+        -- TikTok code ~= 0), body kosong/non-JSON — dibalas sebagai HTTP
+        -- error yang benar, tidak pernah lolos sebagai 200.
+        respond_mutation_result("update_stock", marketplace, response_body, err_info, ctx.request_id)
         return
     end
 
@@ -2492,41 +3956,13 @@ function _M.access(conf, ctx)
             endpoint, marketplace, unified_params, credentials, ctx.adapter, ctx.shop_uuid
         )
 
-        if not response_body then
-            local error_def = UNIFIED_ERRORS[err_info.unified_code] or UNIFIED_ERRORS.UNKNOWN
-            local error_json = build_unified_error(marketplace, error_def.status, err_info, ctx.request_id)
-            respond(error_def.status, error_json)
-            return
-        end
-
-        -- Normalize the response into unified schema
-        local normalized = response_mapping.normalize(
-            endpoint, marketplace, response_body, unified_params
-        )
-
-        if normalized then
-            respond(200, normalized)
-            return
-        end
-
-        -- Fallback: wrap raw response with marketplace info
-        local ok_p, parsed = pcall(cjson.decode, response_body)
-        if ok_p and parsed then
-            local wrapped = {
-                marketplace   = marketplace,
-                action        = "create_product",
-                success       = (parsed.code == 0 or parsed.error == 0 or parsed.error == ""),
-                raw_response  = parsed,
-            }
-            local ok_j, json = pcall(cjson.encode, wrapped)
-            if ok_j then
-                respond(200, json)
-                return
-            end
-        end
-
-        -- Last resort: return raw body
-        respond(200, response_body)
+        -- STRICT: semua error — transport, HTTP 4xx/5xx, business error di
+        -- HTTP 200 (Shopee error flag/failure_list, TikTok code ~= 0),
+        -- body kosong/non-JSON — dibalas sebagai HTTP error yang benar.
+        -- (create_product memakai respond_mutation_result, bukan normalizer,
+        -- agar response-mapping Shopee/TikTok yang mengembalikan nil untuk
+        -- error tidak lagi menyebabkan fallback 200.)
+        respond_mutation_result("create_product", marketplace, response_body, err_info, ctx.request_id, nil, "create_product")
         return
     end
 
@@ -2552,6 +3988,17 @@ function _M.access(conf, ctx)
         -- Defensive: update_status is a per-shop mutation, fan-out is not allowed.
         if marketplace == "all" then
             respond(400, '{"error":{"code":"INVALID_MARKETPLACE","message":"update-status does not support marketplace=all; specify shopee or tiktok"}}')
+            return
+        end
+
+        -- Lazada belum punya padanan update-status di gateway ini.
+        if marketplace == "lazada" then
+            respond(400, cjson.encode({
+                error = {
+                    code = "ENDPOINT_NOT_SUPPORTED",
+                    message = "endpoint 'update_status' not supported for marketplace 'lazada'",
+                }
+            }))
             return
         end
 
@@ -2652,31 +4099,782 @@ function _M.access(conf, ctx)
             effective_endpoint, marketplace, unified_params, credentials, ctx.adapter, ctx.shop_uuid
         )
 
-        if not response_body then
-            local error_def = UNIFIED_ERRORS[err_info.unified_code] or UNIFIED_ERRORS.UNKNOWN
-            local error_json = build_unified_error(marketplace, error_def.status, err_info, ctx.request_id)
-            respond(error_def.status, error_json)
-            return
+        -- STRICT: semua error — transport, HTTP 4xx/5xx, business error di
+        -- HTTP 200 (Shopee failure_list / error flag, TikTok code ~= 0),
+        -- body kosong/non-JSON — dibalas sebagai HTTP error yang benar.
+        respond_mutation_result("update_status", marketplace, response_body, err_info, ctx.request_id, { status = status })
+        return
+    end
+
+    -- ── TikTok Handover Helpers ────────────────────────────────────────────
+    -- Sejak 30 Okt 2024 TikTok MENGABAIKAN `handover_method` untuk seller
+    -- LOKAL di market SEA (ID/SG/PH/VN/TH/MY): collection method diambil dari
+    -- setelan warehouse di Seller Center. Mengirim pickup_slot yang sudah
+    -- kedaluwarsa membuat TikTok membalas error generik:
+    --   code 36009003 — "Internal error. Retry later."
+    -- yang tidak bisa ditindaklanjuti pemanggil gateway.
+    --
+    -- Penanganannya: (1) window pickup yang sudah lewat dibuang sebelum request
+    -- dikirim, dan (2) bila TikTok tetap membalas 36009003, ship diulang SEKALI
+    -- tanpa parameter handover.
+    local TIKTOK_INTERNAL_ERROR_CODE = "36009003"
+
+    --- Apakah respon TikTok berupa error internal generik 36009003?
+    -- Catatan: `make_raw_api_call` mengembalikan body hanya untuk sukses;
+    -- business error (code ~= 0) datang lewat `err_info.original_code`.
+    local function is_tiktok_internal_error(response_body, err_info)
+        if err_info and tostring(err_info.original_code) == TIKTOK_INTERNAL_ERROR_CODE then
+            return true
+        end
+        if not response_body or response_body == "" then
+            return false
+        end
+        local ok, parsed = pcall(cjson.decode, response_body)
+        if not ok or type(parsed) ~= "table" then
+            return false
+        end
+        return tostring(parsed.code) == TIKTOK_INTERNAL_ERROR_CODE
+    end
+
+    --- Buang semua field pemicu handover TikTok dari body per-item.
+    -- `self_shipment` (tracking_number + shipping_provider_id) TIDAK dihapus
+    -- karena masih dipakai paket seller shipping (SEND_BY_SELLER).
+    -- @return boolean - true bila body memang membawa handover_method
+    local function drop_tiktok_handover_fields(body)
+        if type(body) ~= "table" then
+            return false
+        end
+        local had = body.handover_method ~= nil
+        body.handover_method = nil
+        body.pickup          = nil
+        body.pickup_slot     = nil
+        body.start_time      = nil
+        body.end_time        = nil
+        body.address_id      = nil
+        body.pickup_time_id  = nil
+        body.time_slot_id    = nil
+        return had
+    end
+
+    --- Apakah window pickup yang diminta sudah lewat (tidak mungkin dipenuhi)?
+    local function pickup_window_is_stale(body)
+        local start_time, end_time = parameter_mapping.resolve_pickup_times(body, "tiktok")
+        local finish = tonumber(end_time) or tonumber(start_time)
+        if not finish then
+            return false
+        end
+        return finish <= ngx.time()
+    end
+
+    -- ── Shopee pickup_time_id ─────────────────────────────────────────────
+    -- `pickup.pickup_time_id` Shopee BERSIFAT OPSIONAL (nilai valid didapat
+    -- dari API get_pickup_time_id; bila dilepas, Shopee menentukan jadwal
+    -- penjemputan sendiri). Nilai yang tidak valid — mis. slot dummy dari
+    -- client — membuat Shopee membalas:
+    --   logistics.ship_order_pickup_time_invalid
+    -- "Invalid pickup time id. Please check the pick up time id."
+    -- Sebab itu bila Shopee menolaknya, ship diulang SEKALI tanpa pickup_time_id.
+
+    --- Apakah Shopee menolak pickup_time_id yang dikirim?
+    -- Kumpulkan dulu semua teks error (err_info saat HTTP 200 gagal, atau
+    -- body saat diparse ulang) lalu cari pola yang dikenal.
+    local function shopee_error_texts(response_body, err_info)
+        local texts = {}
+        if err_info then
+            texts[#texts + 1] = err_info.original_code
+            texts[#texts + 1] = err_info.message
+        end
+        if response_body and response_body ~= "" then
+            local ok, parsed = pcall(cjson.decode, response_body)
+            if ok and type(parsed) == "table" then
+                texts[#texts + 1] = parsed.error
+                texts[#texts + 1] = parsed.message
+            end
+        end
+        return texts
+    end
+
+    --- Cari salah satu needle (case-insensitive, plain match) di daftar teks.
+    local function text_mentions(texts, needles)
+        for _, text in ipairs(texts) do
+            local hay = tostring(text or ""):lower()
+            if hay ~= "" then
+                for _, needle in ipairs(needles) do
+                    if hay:find(needle, 1, true) then
+                        return true
+                    end
+                end
+            end
+        end
+        return false
+    end
+
+    --- Apakah Shopee menolak pickup_time_id yang dikirim?
+    local function is_shopee_invalid_pickup_time(response_body, err_info)
+        return text_mentions(shopee_error_texts(response_body, err_info), {
+            "pickup_time",
+            "pick up time",
+        })
+    end
+
+    --- Lepas pickup_time_id dari body item (sumber flat maupun objek pickup).
+    -- SEMUA sumber yang bisa mengisi pickup_time_id ikut dibuang (time_slot_id,
+    -- start_time, pickup_slot) supaya request_map tidak menjatuhkan nilai ke
+    -- sumber berikutnya yang juga tidak valid. Field lain (address_id,
+    -- tracking_number, package_number) TIDAK dihapus.
+    -- `params` (params per-item) ikut dibersihkan karena rule config bisa
+    -- memakai sumber prefix `@` yang membaca dari params, bukan dari body.
+    -- @return boolean - true bila memang ada nilai yang dilepas
+    local function drop_shopee_pickup_time_id(body, params)
+        if type(body) ~= "table" then
+            return false
         end
 
-        -- Parse raw body and wrap with marketplace info
-        local ok_p, parsed = pcall(cjson.decode, response_body)
-        if ok_p and parsed then
-            local wrapped = {
-                marketplace   = marketplace,
-                action        = "update_status",
-                status        = status,
-                raw_response  = parsed,
-            }
-            local ok_j, json = pcall(cjson.encode, wrapped)
-            if ok_j then
-                respond(200, json)
-                return
+        local dropped = body.pickup_time_id ~= nil or body.time_slot_id ~= nil
+            or body.start_time ~= nil or body.pickup_slot ~= nil
+        body.pickup_time_id = nil
+        body.time_slot_id   = nil
+        body.start_time     = nil
+        body.pickup_slot    = nil
+
+        local pickup = body.pickup
+        if type(pickup) == "table" then
+            if pickup.pickup_time_id ~= nil or pickup.time_slot_id ~= nil
+                or pickup.start_time ~= nil then
+                dropped = true
+            end
+            pickup.pickup_time_id = nil
+            pickup.time_slot_id   = nil
+            pickup.start_time     = nil
+            if next(pickup) == nil then
+                body.pickup = nil
             end
         end
 
-        -- Fallback: return raw body if JSON wrapping fails
-        respond(200, response_body)
+        if type(params) == "table" then
+            if params.pickup_time_id ~= nil or params.time_slot_id ~= nil
+                or params.start_time ~= nil then
+                dropped = true
+            end
+            params.pickup_time_id = nil
+            params.time_slot_id   = nil
+            params.start_time     = nil
+        end
+
+        return dropped
+    end
+
+    --- Apakah Shopee menolak `package_number` pada order unsplit?
+    -- Catatan ejaan: kode resmi Shopee adalah
+    --   logistics.ship_order_not_need_pacakge_number
+    -- ("pacakge" adalah TYPO dari Shopee), sedangkan pesannya memakai
+    -- "package_number" — keduanya dicakup supaya deteksi tidak meleset.
+    local function is_shopee_unneeded_package_number(response_body, err_info)
+        return text_mentions(shopee_error_texts(response_body, err_info), {
+            "not_need_pacakge",
+            "not_need_package",
+            "pacakge_number",
+            "package_number",
+        })
+    end
+
+    --- Lepas package_number dari body item (dipakai bila Shopee bilang order
+    -- unsplit — ship cukup dengan order_sn).
+    -- @param body - body per-item
+    -- @param params - params per-item; dibersihkan juga karena rule root field
+    --   punya sumber kedua `@package_number` yang membaca dari params.
+    -- @return boolean - true bila memang ada nilai yang dilepas
+    local function drop_shopee_package_number(body, params)
+        local dropped = false
+        if type(body) == "table" and body.package_number ~= nil then
+            body.package_number = nil
+            dropped = true
+        end
+        if type(params) == "table" and params.package_number ~= nil then
+            params.package_number = nil
+            dropped = true
+        end
+        return dropped
+    end
+
+    -- ── SCANNING Shopee: alamat penjemputan & slot pickup yang valid ────────
+    -- `get_shipping_parameter` mengembalikan daftar alamat + opsi pickup_time_id
+    -- untuk satu order. Client sering mengirim nilai placeholder (mis.
+    -- address_id 123456 / time_slot_id "SLOT-123") yang membuat Shopee membalas
+    -- error generik `error_server` — "Something wrong. Please try later."
+    -- Karena itu scanning dilakukan SEBELUM setiap ship PICKUP, dan nilai resmi
+    -- dari Shopee yang dipakai; nilai client tetap dipertahankan bila memang ada
+    -- di daftar resmi Shopee.
+
+    --- Kumpulkan nilai scalar dari key apa pun di seluruh pohon (rekrusif).
+    local function collect_tree_values(node, keys, out, depth)
+        if type(node) ~= "table" or (depth or 0) > 8 then
+            return out
+        end
+
+        for key, value in pairs(node) do
+            if type(value) ~= "table" then
+                for _, want in ipairs(keys) do
+                    if key == want and value ~= nil and value ~= cjson.null
+                        and tostring(value) ~= "" then
+                        out[#out + 1] = tostring(value)
+                    end
+                end
+            end
+        end
+
+        for _, value in pairs(node) do
+            if type(value) == "table" then
+                collect_tree_values(value, keys, out, (depth or 0) + 1)
+            end
+        end
+
+        return out
+    end
+
+    --- Pilih satu kandidat: nilai client dipertahankan bila terdaftar resmi,
+    -- selain itu pakai kandidat pertama dari hasil scanning.
+    local function pick_scanned(candidates, desired)
+        if desired ~= nil and desired ~= "" then
+            local want = tostring(desired)
+            for _, candidate in ipairs(candidates) do
+                if candidate == want then
+                    return want
+                end
+            end
+        end
+        return candidates[1]
+    end
+
+    --- Panggil get_shipping_parameter lalu tulis alamat & slot ke body item.
+    local function apply_scanned_shopee_pickup(item_body, item_params, order_id, credentials, ctx, shop_uuid)
+        local scan_params = {
+            marketplace = "shopee",
+            shop_uuid   = shop_uuid,
+            order_sn    = tostring(order_id),
+            order_id    = tostring(order_id),
+        }
+        local body, err = make_api_call_with_retry(
+            "shipping_parameter", "shopee", scan_params, credentials, ctx.adapter, shop_uuid
+        )
+        if not body then
+            logger.warn("Ship order: get_shipping_parameter gagal — pakai alamat/slot dari client", {
+                marketplace = "shopee",
+                order_id    = tostring(order_id),
+                error       = (err and (err.message or err.unified_code)) or "unknown",
+                request_id  = ctx.request_id,
+            })
+            return
+        end
+
+        local ok, parsed = pcall(cjson.decode, body)
+        if not ok or type(parsed) ~= "table" then
+            return
+        end
+
+        local resp = type(parsed.response) == "table" and parsed.response or parsed
+        local addresses = collect_tree_values(resp, { "address_id" }, {})
+        local time_ids  = collect_tree_values(resp,
+            { "pickup_time_id", "time_slot_id", "time_id", "slot_id" }, {})
+
+        local pickup = type(item_body.pickup) == "table" and item_body.pickup or {}
+        local desired_address = pickup.address_id or item_body.address_id
+        local desired_time    = pickup.time_slot_id or pickup.pickup_time_id
+            or item_body.time_slot_id or item_body.pickup_time_id
+
+        local address = pick_scanned(addresses, desired_address)
+        local time_id = pick_scanned(time_ids, desired_time)
+
+        if not address and not time_id then
+            logger.warn("Ship order: get_shipping_parameter tidak mengembalikan alamat/slot — pakai nilai client", {
+                marketplace       = "shopee",
+                order_id          = tostring(order_id),
+                address_found     = #addresses,
+                pickup_time_found = #time_ids,
+                request_id        = ctx.request_id,
+            })
+            return
+        end
+
+        item_body.pickup = pickup
+
+        if address then
+            -- rule mapping `pickup.address_id` punya sumber `address_id` datar
+            -- sebagai cadangan, jadi objek pickup cukup diisi di sini.
+            pickup.address_id = address
+            item_body.address_id = nil
+        end
+
+        if time_id then
+            -- Buang semua sumber placeholder (flat & nested) dulu, lalu isi
+            -- dengan id resmi — nilai client tidak boleh menimpa hasil scan.
+            drop_shopee_pickup_time_id(item_body, item_params)
+            item_body.pickup = pickup
+            pickup.pickup_time_id = time_id
+        end
+
+        logger.info("Ship order: scanning Shopee pickup selesai", {
+            marketplace        = "shopee",
+            order_id           = tostring(order_id),
+            address_id         = tostring(address or ""),
+            pickup_time_id      = tostring(time_id or ""),
+            address_candidates = #addresses,
+            time_candidates    = #time_ids,
+        })
+    end
+
+    -- ── SHIP ORDER / SHIP PACKAGE ENDPOINT ─────────────────────────────────
+    -- Initiates shipment for an order or package.
+    --   Shopee: POST /api/v2/logistics/ship_order
+    --   TikTok: POST /fulfillment/202309/packages/{package_id}/ship
+    --
+    -- URL formats:
+    --   POST /ship-order?marketplace=shopee&shop_uuid=...
+    --   POST /ship-order/{order_sn_or_package_id}?marketplace=...
+    --   Aliases: /ship, /ship-package
+    if endpoint == "ship_order" then
+        -- Defensive: ship_order is a per-shop mutation, fan-out is not allowed.
+        if marketplace == "all" then
+            respond(400, '{"error":{"code":"INVALID_MARKETPLACE","message":"ship-order does not support marketplace=all; specify shopee or tiktok"}}')
+            return
+        end
+
+        -- Read POST body
+        ngx.req.read_body()
+        local body_data = ngx.req.get_body_data()
+        local parsed_body = {}
+        if body_data and body_data ~= "" then
+            local ok_body, pb = pcall(cjson.decode, body_data)
+            if not ok_body or not pb or type(pb) ~= "table" then
+                respond(400, '{"error":{"code":"INVALID_JSON","message":"invalid JSON in request body"}}')
+                return
+            end
+            parsed_body = pb
+        end
+
+        -- Reject fields outside the allowed whitelist (strict validation)
+        if not reject_disallowed_fields(endpoint, marketplace, parsed_body) then
+            return
+        end
+
+        -- ── Kumpulkan order id (mendukung ARRAY untuk batching) ────────────
+        -- Sumber: path (/ship-order/{id1,id2}), query (ids / order_ids /
+        -- order_id / order_sn / package_id), dan body. Nilai boleh berupa
+        -- string, string dipisah koma, ataupun array JSON.
+        local order_ids = collect_ship_order_ids(product_id, args, parsed_body)
+        if #order_ids == 0 then
+            respond(400, cjson.encode({
+                error = {
+                    code = "INVALID_PARAMETER",
+                    message = "order_id is required (single id, comma-separated ids, or an array of ids for batch shipping)",
+                }
+            }))
+            return
+        end
+
+        local ship_options = update_config.get_options("ship_order", marketplace)
+        local max_batch_size = math.floor(tonumber(ship_options.max_batch_size) or 50)
+        if max_batch_size > 0 and #order_ids > max_batch_size then
+            respond(400, cjson.encode({
+                error = {
+                    code = "BATCH_TOO_LARGE",
+                    message = string.format(
+                        "too many order ids: %d (max %d per request; ubah endpoints.ship_order.%s.options.max_batch_size)",
+                        #order_ids, max_batch_size, marketplace
+                    ),
+                }
+            }))
+            return
+        end
+
+        -- ── Standardized handover resolution ─────────────────────────────
+        -- Client mengirim satu bentuk body standar untuk semua marketplace.
+        -- Metode dinormalkan (PICK_UP → PICKUP, DROPOFF → DROP_OFF, dst.)
+        -- lalu divalidasi sesuai kebutuhan marketplace.
+        local is_pickup_alias = uri ~= nil
+            and (uri:find("^/request%-pickup") ~= nil or uri:find("^/pickup") ~= nil)
+
+        local handover_method, handover_err = parameter_mapping.resolve_handover_method(parsed_body, marketplace)
+        if handover_err then
+            respond(400, cjson.encode({
+                error = { code = "INVALID_PARAMETER", message = handover_err }
+            }))
+            return
+        end
+
+        if is_pickup_alias then
+            -- /request-pickup dan /pickup khusus pickup: jangan diam-diam
+            -- mengubah request DROP_OFF/SELF_SHIPMENT menjadi PICKUP.
+            if handover_method and handover_method ~= "PICKUP" then
+                respond(400, cjson.encode({
+                    error = {
+                        code = "INVALID_PARAMETER",
+                        message = "endpoint " .. tostring(uri)
+                            .. " only supports handover_method 'PICKUP' (got '"
+                            .. tostring(parsed_body.handover_method) .. "')",
+                    }
+                }))
+                return
+            end
+            handover_method = "PICKUP"
+            parsed_body.handover_method = "PICKUP"
+        end
+
+        if not handover_method then
+            respond(400, cjson.encode({
+                error = {
+                    code = "INVALID_PARAMETER",
+                    message = "handover_method is required: PICKUP, DROP_OFF, "
+                        .. "NON_INTEGRATED, or SELF_SHIPMENT (or provide the "
+                        .. "corresponding pickup/dropoff/non_integrated/"
+                        .. "self_shipment fields)",
+                }
+            }))
+            return
+        end
+
+        -- Marketplace specific requirements validation (berlaku untuk SEMUA
+        -- item di batch; order_sn / package_id ditentukan per item di bawah).
+        if marketplace == "shopee" then
+            if handover_method == "PICKUP" then
+                local addr_id = (type(parsed_body.pickup) == "table" and parsed_body.pickup.address_id)
+                    or parsed_body.address_id
+                if not addr_id or addr_id == "" then
+                    respond(400, cjson.encode({
+                        error = {
+                            code = "INVALID_PARAMETER",
+                            message = "address_id is required for Shopee pickup (provide in body as address_id or pickup.address_id)",
+                        }
+                    }))
+                    return
+                end
+            elseif handover_method == "NON_INTEGRATED" or handover_method == "SELF_SHIPMENT" then
+                local trk = (type(parsed_body.non_integrated) == "table" and parsed_body.non_integrated.tracking_number)
+                    or (type(parsed_body.self_shipment) == "table" and parsed_body.self_shipment.tracking_number)
+                    or parsed_body.tracking_number
+                if not trk or trk == "" then
+                    respond(400, cjson.encode({
+                        error = {
+                            code = "INVALID_PARAMETER",
+                            message = "tracking_number is required for Shopee " .. handover_method
+                                .. " (provide tracking_number, non_integrated.tracking_number, or self_shipment.tracking_number)",
+                        }
+                    }))
+                    return
+                end
+            end
+
+        elseif marketplace == "tiktok" then
+            if handover_method == "PICKUP" then
+                local start_time, end_time = parameter_mapping.resolve_pickup_times(parsed_body, marketplace)
+                if not start_time and not end_time then
+                    respond(400, cjson.encode({
+                        error = {
+                            code = "INVALID_PARAMETER",
+                            message = "pickup start_time/end_time (Unix seconds) is required for TikTok pickup "
+                                .. "(provide pickup.start_time/pickup.end_time, "
+                                .. "pickup_slot.start_time/pickup_slot.end_time, or flat start_time/end_time)",
+                        }
+                    }))
+                    return
+                end
+            elseif handover_method == "NON_INTEGRATED" or handover_method == "SELF_SHIPMENT" then
+                local trk = (type(parsed_body.self_shipment) == "table" and parsed_body.self_shipment.tracking_number)
+                    or (type(parsed_body.non_integrated) == "table" and parsed_body.non_integrated.tracking_number)
+                    or parsed_body.tracking_number
+                if not trk or trk == "" then
+                    respond(400, cjson.encode({
+                        error = {
+                            code = "INVALID_PARAMETER",
+                            message = "tracking_number is required for TikTok " .. handover_method
+                                .. " (provide tracking_number, self_shipment.tracking_number, or non_integrated.tracking_number)",
+                        }
+                    }))
+                    return
+                end
+            end
+        end
+
+        unified_params.body_data = parsed_body
+
+        -- ── SCANNING: ambil package native (TikTok package_id / Shopee
+        -- package_number) dari GET order detail sebelum ship. ──────────────
+        local explicit_package = nil
+        if marketplace == "shopee" then
+            explicit_package = parsed_body.package_number or args.package_number
+        else
+            explicit_package = parsed_body.package_id or args.package_id
+        end
+
+        local targets = {}
+        if explicit_package ~= nil and tostring(explicit_package) ~= "" then
+            -- Client menyebut paket native secara eksplisit: kirim paket itu saja.
+            targets[1] = {
+                order_id = order_ids[1],
+                package  = tostring(explicit_package),
+            }
+            logger.info("Ship order: paket native eksplisit dari client", {
+                marketplace = marketplace,
+                package     = tostring(explicit_package),
+                request_id  = ctx.request_id,
+            })
+        else
+            local scan_map = scan_order_packages(marketplace, order_ids, credentials, ctx, args.shop_uuid)
+            for _, order_id in ipairs(order_ids) do
+                local entry = scan_map[order_id]
+                if entry and #entry.packages > 0 then
+                    -- SEMUA paket order dikirim (Shopee split order / TikTok
+                    -- multi-package): satu panggilan ship per paket.
+                    --
+                    -- Pengecualian Shopee: `package_number` hanya untuk order
+                    -- yang benar-benar SPLIT (lebih dari satu paket). Order
+                    -- unsplit (satu paket di package_list) ditolak Shopee bila
+                    -- package_number ikut dikirim:
+                    --   logistics.ship_order_not_need_pacakge_number
+                    -- "Please don't request with package_number for this
+                    --  unsplit order."
+                    local per_package = #entry.packages > 1 or marketplace ~= "shopee"
+                    if per_package then
+                        for _, package in ipairs(entry.packages) do
+                            targets[#targets + 1] = { order_id = order_id, package = package }
+                        end
+                    else
+                        logger.info("Ship order: Shopee order unsplit — package_number tidak dikirim (ship per order_sn)", {
+                            marketplace   = marketplace,
+                            order_id      = tostring(order_id),
+                            package_count = #entry.packages,
+                        })
+                        targets[#targets + 1] = { order_id = order_id, package = nil }
+                    end
+                else
+                    -- Tidak ada paket hasil scan (order non-split, atau scan
+                    -- gagal) → pakai id apa adanya seperti perilaku lama.
+                    targets[#targets + 1] = { order_id = order_id, package = nil }
+                end
+            end
+        end
+
+        -- Window pickup yang sudah lewat tidak mungkin dipenuhi TikTok dan
+        -- hanya menghasilkan 36009003; buang parameternya sejak awal agar
+        -- request tetap dikirim memakai collection method default.
+        local tiktok_drop_handover = false
+        if marketplace == "tiktok" and handover_method == "PICKUP"
+            and pickup_window_is_stale(parsed_body) then
+            tiktok_drop_handover = true
+            logger.warn("Ship order: window pickup sudah lewat — parameter handover TikTok dibuang (pakai collection method default)", {
+                marketplace = marketplace,
+                request_id  = ctx.request_id,
+                start_time  = tostring(parsed_body.start_time),
+                end_time    = tostring(parsed_body.end_time),
+            })
+        end
+
+        -- ── Kirim ship per target & agregasi hasil ────────────────────────
+        local results       = {}
+        local success_count = 0
+        local failed_count  = 0
+        local first_error   = nil
+        local first_status  = nil
+        local single_result = nil
+
+        for _, target in ipairs(targets) do
+            -- Body per item: batch mengirim array id, jadi id dan paket diganti
+            -- milik target agar tidak bocor ke body native marketplace.
+            local item_body = {}
+            for key, value in pairs(parsed_body) do
+                item_body[key] = value
+            end
+            item_body.order_ids  = nil
+            item_body.order_sn   = nil
+            item_body.package_id = nil
+            item_body.order_id   = tostring(target.order_id)
+
+            local item_params = {
+                body_data   = item_body,
+                marketplace = marketplace,
+                shop_uuid   = args.shop_uuid,
+            }
+
+            if marketplace == "shopee" then
+                item_body.order_sn         = tostring(target.order_id)
+                item_params.order_sn       = tostring(target.order_id)
+                item_params.order_id       = tostring(target.order_id)
+                item_params.product_id     = tostring(target.order_id)
+                if target.package then
+                    item_body.package_number   = target.package
+                    item_params.package_number = target.package
+                end
+            else
+                local native_package       = target.package or tostring(target.order_id)
+                item_body.package_id       = native_package
+                item_params.package_id     = native_package
+                item_params.order_id       = tostring(target.order_id)
+                item_params.product_id     = native_package
+            end
+
+            -- SCANNING Shopee PICKUP: ambil alamat penjemputan + slot pickup
+            -- yang valid dari get_shipping_parameter SEBELUM ship.
+            if marketplace == "shopee" and handover_method == "PICKUP" then
+                apply_scanned_shopee_pickup(
+                    item_body, item_params, target.order_id, credentials, ctx, args.shop_uuid
+                )
+            end
+
+            if tiktok_drop_handover then
+                drop_tiktok_handover_fields(item_body)
+            end
+
+            local response_body, err_info = make_api_call_with_retry(
+                endpoint, marketplace, item_params, credentials, ctx.adapter, ctx.shop_uuid
+            )
+
+            -- Fallback 36009003: TikTok menolak body handover yang tidak berlaku
+            -- (mis. seller lokal SEA yang collection method-nya diatur di Seller
+            -- Center). Ulangi SEKALI tanpa parameter handover.
+            if marketplace == "tiktok" and not tiktok_drop_handover
+                and is_tiktok_internal_error(response_body, err_info)
+                and drop_tiktok_handover_fields(item_body) then
+                logger.warn("Ship order: TikTok 36009003 — mengulang tanpa parameter handover", {
+                    marketplace = marketplace,
+                    order_id    = tostring(target.order_id),
+                    request_id  = ctx.request_id,
+                })
+                response_body, err_info = make_api_call_with_retry(
+                    endpoint, marketplace, item_params, credentials, ctx.adapter, ctx.shop_uuid
+                )
+            end
+
+            -- ── Fallback Shopee (rantai, maksimal 2x ulang) ───────────────
+            -- Setiap penyebab yang bisa diperbaiki dengan melepas field
+            -- bermasalah diulang sekali, dan respons ulangan diperiksa ulang
+            -- oleh penyebab berikutnya supaya bisa berantai
+            -- (mis. pickup_time_id → package_number).
+            if marketplace == "shopee" then
+                local shopee_fallbacks = {
+                    {
+                        check = is_shopee_invalid_pickup_time,
+                        drop  = drop_shopee_pickup_time_id,
+                        why   = "menolak pickup_time_id — mengulang tanpa pickup_time_id (jadwal penjemputan ditentukan Shopee)",
+                    },
+                    {
+                        check = is_shopee_unneeded_package_number,
+                        drop  = drop_shopee_package_number,
+                        why   = "menolak package_number (order unsplit) — mengulang tanpa package_number",
+                    },
+                }
+
+                for _ = 1, #shopee_fallbacks do
+                    local matched = nil
+                    for _, fb in ipairs(shopee_fallbacks) do
+                        if fb.check(response_body, err_info) and fb.drop(item_body, item_params) then
+                            matched = fb
+                            break
+                        end
+                    end
+                    if not matched then
+                        break
+                    end
+
+                    logger.warn("Ship order: Shopee " .. matched.why, {
+                        marketplace = marketplace,
+                        order_id    = tostring(target.order_id),
+                        request_id  = ctx.request_id,
+                    })
+                    response_body, err_info = make_api_call_with_retry(
+                        endpoint, marketplace, item_params, credentials, ctx.adapter, ctx.shop_uuid
+                    )
+                end
+            end
+
+            -- Semantik error/sukses identik dengan mode single.
+            local evaluated = evaluate_mutation_result(
+                "ship_order", marketplace, response_body, err_info, ctx.request_id,
+                nil, translate and "ship_order" or nil,
+                {
+                    order_sn   = item_params.order_sn,
+                    order_id   = item_params.order_id,
+                    package_id = item_params.package_id,
+                    product_id = item_params.product_id,
+                    id         = item_params.order_id,
+                }
+            )
+            single_result = evaluated
+
+            local entry = {
+                order_id = tostring(target.order_id),
+                success  = evaluated.ok,
+                status   = evaluated.status,
+            }
+            if target.package then
+                if marketplace == "shopee" then
+                    entry.package_number = tostring(target.package)
+                else
+                    entry.package_id = tostring(target.package)
+                end
+            end
+
+            local ok_dec, decoded = pcall(cjson.decode, evaluated.body)
+            if evaluated.ok then
+                success_count = success_count + 1
+                entry.response = (ok_dec and decoded) or evaluated.body
+            else
+                failed_count = failed_count + 1
+                local err_table = (ok_dec and type(decoded) == "table") and decoded.error or nil
+                entry.error = err_table or {
+                    code    = "UPSTREAM_ERROR",
+                    message = tostring(evaluated.body),
+                }
+                if not first_error then
+                    first_error  = entry.error
+                    first_status = evaluated.status
+                end
+            end
+
+            results[#results + 1] = entry
+        end
+
+        -- Satu target → bentuk respon lama (kompatibel untuk pemakaian single).
+        if #targets <= 1 then
+            if single_result then
+                respond(single_result.status, single_result.body)
+            else
+                respond(500, '{"error":{"code":"INTERNAL_ERROR","message":"no ship target to process"}}')
+            end
+            return
+        end
+
+        -- Mode batch → ringkasan per item.
+        local summary = {
+            marketplace     = marketplace,
+            action          = "ship_order",
+            handover_method = handover_method,
+            total           = #results,
+            success         = success_count,
+            failed          = failed_count,
+            results         = results,
+        }
+
+        -- 200 = semua sukses, 207 = sebagian gagal, status error = gagal semua.
+        local http_status = 200
+        if failed_count > 0 then
+            summary.error = first_error
+            http_status = (success_count > 0) and 207 or (first_status or 500)
+        end
+
+        logger.info("Ship order batch finished", {
+            marketplace = marketplace,
+            total       = #results,
+            success     = success_count,
+            failed      = failed_count,
+            request_id  = ctx.request_id,
+        })
+
+        local ok_enc, encoded = pcall(cjson.encode, summary)
+        if not ok_enc or not encoded then
+            respond(500, '{"error":{"code":"INTERNAL_ERROR","message":"failed to encode batch ship result"}}')
+            return
+        end
+        respond(http_status, encoded)
         return
     end
 
@@ -2689,17 +4887,18 @@ function _M.access(conf, ctx)
     if endpoint == "products" then
         -- Determine which statuses to fetch based on filter
         -- Jika ada filter status: fetch single status
-        -- Jika tidak ada filter: fetch ACTIVE + INACTIVE (masing-masing 1 API call)
+        -- Jika tidak ada filter: fetch ACTIVE saja.
         local statuses_to_fetch = {}
         if unified_params.status and unified_params.status ~= "" then
             statuses_to_fetch[1] = unified_params.status
         else
-            statuses_to_fetch = { "ACTIVE", "INACTIVE" }
+            statuses_to_fetch = { "ACTIVE" }
         end
 
         -- Fetch product list(s) — multiple API calls if needed
         local merged_body = nil
         local any_success = false
+        local last_err_info = nil
         for _, fetch_status in ipairs(statuses_to_fetch) do
             -- Create a params copy with the specific status filter
             local params = {}
@@ -2720,6 +4919,7 @@ function _M.access(conf, ctx)
                 end
                 any_success = true
             else
+                last_err_info = err_info
                 logger.warn("Products: failed to fetch for status", {
                     status      = fetch_status,
                     marketplace = marketplace,
@@ -2730,6 +4930,14 @@ function _M.access(conf, ctx)
         end
 
         if not any_success or not merged_body then
+            -- Tampilkan pesan asli marketplace (mis. Lazada InvalidAppKey)
+            if last_err_info and last_err_info.message then
+                local error_def = UNIFIED_ERRORS[last_err_info.unified_code] or UNIFIED_ERRORS.UNKNOWN
+                respond(error_def.status, build_unified_error(
+                    marketplace, error_def.status, last_err_info, ctx.request_id
+                ))
+                return
+            end
             respond(502, '{"error":{"code":"UPSTREAM_ERROR","message":"failed to fetch products from marketplace"}}')
             return
         end

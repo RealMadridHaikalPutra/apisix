@@ -11,13 +11,14 @@
 --       2026-07-03_142530_abc123.json
 --       ...
 --     tiktok/
+--     lazada/
 --       2026-07-03_142531_def456.json
 --       ...
 --
 -- Each file contains the complete raw payload plus metadata:
 -- {
 --   "received_at": "2026-07-03T14:25:30Z",
---   "marketplace": "shopee|tiktok",
+--   "marketplace": "shopee|tiktok|lazada",
 --   "event_type": "stock_update",
 --   "shop_id": "...",
 --   "payload": { ... raw webhook body ... }
@@ -88,7 +89,7 @@ end
 
 --- Generate a unique filename for a webhook payload.
 -- Format: {YYYY-MM-DD}_{HHMMSS}_{random_hex}.json
--- @param marketplace - "shopee" or "tiktok"
+-- @param marketplace - "shopee", "tiktok" atau "lazada"
 -- @return string - Unique filename
 local function generate_filename()
     local timestamp = os.date("!%Y-%m-%d_%H%M%S")
@@ -103,7 +104,7 @@ end
 --- Save a webhook payload to a JSON file.
 -- Organizes by marketplace and date for easy browsing.
 --
--- @param marketplace - "shopee" or "tiktok"
+-- @param marketplace - "shopee", "tiktok" atau "lazada"
 -- @param event_type - Type of event (e.g., "stock_update", "challenge")
 -- @param shop_id - Shop identifier from the webhook payload
 -- @param raw_payload - Complete raw webhook body (table or string)
@@ -118,7 +119,7 @@ function _M.save_payload(marketplace, event_type, shop_id, raw_payload)
     end
 
     marketplace = marketplace:lower()
-    if marketplace ~= "shopee" and marketplace ~= "tiktok" then
+    if marketplace ~= "shopee" and marketplace ~= "tiktok" and marketplace ~= "lazada" then
         return nil, string.format("unsupported marketplace: %s", marketplace)
     end
 
@@ -182,7 +183,7 @@ function _M.save_payload(marketplace, event_type, shop_id, raw_payload)
 end
 
 --- List saved webhook files for a marketplace.
--- @param marketplace - "shopee" or "tiktok" (optional, list all if nil)
+-- @param marketplace - "shopee", "tiktok" atau "lazada" (optional, list all if nil)
 -- @param limit - Maximum number of files to return (default: 20)
 -- @return table - Array of fileinfo tables: { path, filename, size, modified_at }
 function _M.list_payloads(marketplace, limit)
@@ -195,6 +196,7 @@ function _M.list_payloads(marketplace, limit)
     else
         dirs[#dirs + 1] = string.format("%s/shopee", WEBHOOK_DATA_DIR)
         dirs[#dirs + 1] = string.format("%s/tiktok", WEBHOOK_DATA_DIR)
+        dirs[#dirs + 1] = string.format("%s/lazada", WEBHOOK_DATA_DIR)
     end
 
     for _, dir in ipairs(dirs) do

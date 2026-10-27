@@ -187,18 +187,44 @@ local function normalize_shopee_products(raw_body, unified_params)
   end
 
   local total_count = tonumber(response.total_count) or tonumber(response.item_count) or #products
-  local page_size = unified_params.page_size or 50
+  local page_size = (unified_params and unified_params.page_size) or 50
+  local page = (unified_params and unified_params.page) or 1
   local total_pages = math.ceil(total_count / page_size)
+
+  local has_more = response.has_more
+  if has_more == cjson.null then has_more = nil end
+  local has_next_page = response.has_next_page
+  if has_next_page == cjson.null then has_next_page = nil end
+  local next_cursor = response.next_cursor
+  if next_cursor == cjson.null then next_cursor = nil end
+  local next_offset = response.next_offset
+  if next_offset == cjson.null then next_offset = nil end
+
+  local has_next = has_next_page
+  if has_next == nil then
+    has_next = has_more
+  end
+  if has_next == nil then
+    has_next = (next_cursor ~= nil and next_cursor ~= "") or (next_offset ~= nil and next_offset ~= "")
+  end
+  if has_next == nil then
+    has_next = page < total_pages
+  end
+
+  local next_page_token = next_cursor
+  if next_page_token == nil then
+    next_page_token = next_offset
+  end
 
   return {
     marketplace = "shopee",
     products = products,
     pagination = {
-      page     = unified_params.page or 1,
+      page     = page,
       page_size = page_size,
       total    = total_count,
-      has_next = (unified_params.page or 1) < total_pages,
-      next_page_token = nil,
+      has_next = (has_next == true),
+      next_page_token = next_page_token,
     },
   }
 end
@@ -618,6 +644,14 @@ local RESERVED_ORDER_STATUSES = {
     UNPAID        = true,
     READY_TO_SHIP = true,
   },
+  -- Lazada native statuses (lowercase di API, di-uppercase saat normalisasi)
+  lazada = {
+    UNPAID        = true,
+    PENDING       = true,
+    READY_TO_SHIP = true,
+    TOPACK        = true,
+    TOSHIP        = true,
+  },
 }
 
 --- Aggregate reserved stock from order line items, grouped by product + variant (SKU).
@@ -820,6 +854,7 @@ local function normalize_tiktok_orders(raw_body, unified_params)
     marketplace     = "tiktok",
     reserved_stock  = aggregate_reserved_stock(orders, RESERVED_ORDER_STATUSES.tiktok),
     total_count     = total_count or #orders,
+    has_more        = false,
     next_page_token = next_page_token,
   }
 end
@@ -854,13 +889,17 @@ local function normalize_shopee_order(order)
   local line_items = {}
   if order.item_list and type(order.item_list) == "table" then
     for _, li in ipairs(order.item_list) do
+      local model_id = tonumber(li.model_id)
+      local variant_id = model_id and model_id > 0
+        and tostring(li.model_id)
+        or tostring(li.item_id or "")
       line_items[#line_items + 1] = {
         id             = tostring(li.item_id or ""),
-        sku_id         = tostring(li.model_id or ""),
+        sku_id         = variant_id,
         product_id     = tostring(li.item_id or ""),
         product_name   = li.item_name or "",
         sku_name       = li.model_name or "",
-        seller_sku     = li.model_sku or li.item_sku or "",
+        seller_sku     = li.model_sku or li.item_sku or order.item_sku or "",
         quantity       = tonumber(li.model_quantity_purchased) or 0,
         sale_price     = li.model_discounted_price or "0",
         original_price = li.model_original_price or "0",
@@ -944,6 +983,183 @@ local function normalize_shopee_orders(raw_body, unified_params)
     total_count     = tonumber(response.total_count) or #orders,
     has_more        = more,
     next_page_token = (next_cursor ~= nil and next_cursor ~= "") and next_cursor or nil,
+  }
+end
+
+-- ── Lazada Order Response Normalization ───────────────────────────────────
+
+--- Parse a Lazada datetime string into a Unix timestamp (detik).
+-- Lazada memakai format "2026-10-20 12:34:56 +0700" maupun ISO 8601.
+-- Nilai yang tidak dikenali dikembalikan sebagai 0 agar schema tetap konsisten.
+-- @param value - Raw datetime string
+-- @return number - Unix timestamp atau 0
+local function parse_lazada_datetime(value)
+  if value == nil or value == cjson.null then
+    return 0
+  end
+  if type(value) == "number" then
+    return value
+  end
+
+  local s = tostring(value)
+  local y, m, d, hh, mm, ss = s:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)[T ](%d%d):(%d%d):(%d%d)")
+  if not y then
+    -- Date-only (YYYY-MM-DD)
+    y, m, d = s:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)")
+    hh, mm, ss = "00", "00", "00"
+  end
+  if not y then
+    return 0
+  end
+
+  local epoch = os.time({
+    year  = tonumber(y),
+    month = tonumber(m),
+    day   = tonumber(d),
+    hour  = tonumber(hh),
+    min   = tonumber(mm),
+    sec   = tonumber(ss),
+    isdst = false,
+  })
+  return epoch or 0
+end
+
+--- Normalize a single Lazada order into the unified order schema.
+-- GetOrders (list) hanya berisi data level order; request-transformer
+-- menempelkan hasil GetOrderItems ke tiap order sebagai `_items` sebelum
+-- normalisasi (list mode). GetOrderItems (detail) mengembalikan array item,
+-- yang dikelompokkan per order_id lalu dibentuk menjadi order sintetis.
+--
+-- @param order - Raw Lazada order table (dengan `_items` opsional)
+-- @return table - Unified order object
+local function normalize_lazada_order(order)
+  if not order then
+    return nil
+  end
+
+  local payment = {
+    currency     = order.currency or "",
+    total_amount = tostring(order.price or "0"),
+  }
+  if order.shipping_fee ~= nil and order.shipping_fee ~= cjson.null then
+    payment.shipping_fee = tostring(order.shipping_fee)
+  end
+
+  local line_items = {}
+  local items = order._items or order.order_items or {}
+  if type(items) == "table" then
+    for _, li in ipairs(items) do
+      -- Lazada GetOrderItems: `sku` = SellerSku, `shop_sku` = Lazada SKU ID
+      local variant_id = tostring(li.shop_sku or li.SkuId or li.sku or "")
+      local qty = tonumber(li.quantity)
+      if qty == nil or qty < 1 then
+        qty = 1  -- setiap baris item Lazada dihitung satu unit bila tanpa quantity
+      end
+      line_items[#line_items + 1] = {
+        id             = tostring(li.order_item_id or ""),
+        sku_id         = variant_id,
+        product_id     = tostring(li.product_id or ""),
+        product_name   = li.product_name or li.name or "",
+        sku_name       = li.sku_name or li.variation or "",
+        seller_sku     = li.sku or li.SellerSku or "",
+        quantity       = qty,
+        sale_price     = tostring(li.paid_price or li.item_price or "0"),
+        original_price = tostring(li.item_price or "0"),
+        currency       = li.currency or order.currency or "",
+        status         = tostring(li.status or ""):upper(),
+        package_id     = tostring(li.package_id or ""),
+        tracking_number = li.tracking_code or li.tracking_number or "",
+      }
+    end
+  end
+
+  return {
+    id                      = tostring(order.order_id or order.id or ""),
+    status                  = tostring(order.status or ""):upper(),
+    create_time             = parse_lazada_datetime(order.created_at or order.create_time),
+    update_time             = parse_lazada_datetime(order.updated_at or order.update_time),
+    paid_time               = parse_lazada_datetime(order.payment_time or order.paid_at),
+    buyer_message           = order.buyer_note or order.remarks or "",
+    buyer_username          = order.customer_first_name or "",
+    user_id                 = tostring(order.customer_id or order.buyer_id or ""),
+    payment_method_name     = order.payment_method or "",
+    is_cod                  = order.payment_method == "COD",
+    cancel_reason           = order.cancel_reason or "",
+    payment                 = payment,
+    recipient_address       = order.address_shipping or order.address_billing or {},
+    packages                = {},
+    line_items              = line_items,
+  }
+end
+
+--- Normalize a Lazada order response into the reserved-stock schema.
+-- Mendukung DUA bentuk response:
+--   GetOrders      → { code, data: { count, countTotal, orders: [...] } }
+--   GetOrderItems  → { code, data: [ <order item>, ... ] }
+--
+-- Output sama dengan marketplace lain:
+--   { marketplace, reserved_stock: [...], total_count, has_more, next_page_token }
+--
+-- @param raw_body - Raw JSON string from Lazada API
+-- @param unified_params - Original unified parameters (unused for this schema)
+-- @return table|nil - Unified response, or nil on parse error
+local function normalize_lazada_orders(raw_body, unified_params)
+  local ok, data = pcall(cjson.decode, raw_body)
+  if not ok or not data then
+    logger.error("Failed to parse Lazada order response JSON")
+    return nil
+  end
+
+  local payload = data.data
+  if payload == nil or payload == cjson.null then
+    payload = data
+  end
+
+  local orders = {}
+
+  if type(payload) == "table" and type(payload.orders) == "table" then
+    -- GetOrders (list)
+    for _, item in ipairs(payload.orders) do
+      local order = normalize_lazada_order(item)
+      if order then
+        orders[#orders + 1] = order
+      end
+    end
+  elseif type(payload) == "table" and payload[1] ~= nil then
+    -- GetOrderItems (detail) → group line items per order_id
+    local by_order = {}
+    local order_ids = {}
+    for _, li in ipairs(payload) do
+      local oid = tostring(li.order_id or "")
+      if oid ~= "" then
+        local entry = by_order[oid]
+        if not entry then
+          entry = { order_id = oid, status = li.status, _items = {} }
+          by_order[oid] = entry
+          order_ids[#order_ids + 1] = oid
+        end
+        entry._items[#entry._items + 1] = li
+      end
+    end
+    for _, oid in ipairs(order_ids) do
+      local order = normalize_lazada_order(by_order[oid])
+      if order then
+        orders[#orders + 1] = order
+      end
+    end
+  end
+
+  local total_count = #orders
+  if type(payload) == "table" and payload.countTotal ~= nil then
+    total_count = tonumber(payload.countTotal) or #orders
+  end
+
+  return {
+    marketplace     = "lazada",
+    reserved_stock  = aggregate_reserved_stock(orders, RESERVED_ORDER_STATUSES.lazada),
+    total_count     = total_count,
+    has_more        = false,
+    next_page_token = nil,
   }
 end
 
@@ -1115,6 +1331,88 @@ local function normalize_shopee_create_product(raw_body)
   }
 end
 
+-- ── TikTok Ship Package Response Normalization ────────────────────────────
+
+--- Normalize a TikTok Ship Package response into unified schema.
+-- TikTok response: { code: 0, message: "Success", request_id: "...", data: {} }
+-- @param raw_body - Raw JSON string from TikTok API
+-- @param params - Unified parameters
+-- @return table|nil - Unified response
+local function normalize_tiktok_ship_order(raw_body, params)
+  local ok, data = pcall(cjson.decode, raw_body)
+  if not ok or not data then
+    return nil
+  end
+
+  if data.code ~= 0 then
+    logger.warn("TikTok ship package returned error", {
+      code = data.code,
+      message = data.message,
+    })
+    return nil
+  end
+
+  local pkg_id = (params and (params.package_id or params.order_id or params.id or params.product_id)) or ""
+
+  return {
+    marketplace = "tiktok",
+    action = "ship_order",
+    success = true,
+    request_id = data.request_id or "",
+    message = data.message or "Success",
+    data = {
+      package_id = tostring(pkg_id),
+      raw_response = data.data or {},
+    },
+  }
+end
+
+-- ── Shopee Ship Order Response Normalization ──────────────────────────────
+
+--- Normalize a Shopee Ship Order response into unified schema.
+-- Shopee response: { error: "", message: "", request_id: "..." }
+-- @param raw_body - Raw JSON string from Shopee API
+-- @param params - Unified parameters
+-- @return table|nil - Unified response
+local function normalize_shopee_ship_order(raw_body, params)
+  local ok, data = pcall(cjson.decode, raw_body)
+  if not ok or not data then
+    return nil
+  end
+
+  -- Check for Shopee errors
+  local err_val = data.error
+  if err_val ~= nil then
+    if type(err_val) == "number" and err_val ~= 0 then
+      logger.warn("Shopee ship order returned error", {
+        error = err_val,
+        message = data.message,
+      })
+      return nil
+    elseif type(err_val) == "string" and err_val ~= "" then
+      logger.warn("Shopee ship order returned error", {
+        error = err_val,
+        message = data.message,
+      })
+      return nil
+    end
+  end
+
+  local order_sn = (params and (params.order_sn or params.order_id or params.id or params.product_id)) or ""
+
+  return {
+    marketplace = "shopee",
+    action = "ship_order",
+    success = true,
+    request_id = data.request_id or "",
+    message = (data.message and data.message ~= "") and data.message or "Success",
+    data = {
+      order_sn = tostring(order_sn),
+      raw_response = data,
+    },
+  }
+end
+
 local NORMALIZATION_REGISTRY = {
   products = {
     shopee = normalize_shopee_products,
@@ -1134,10 +1432,16 @@ local NORMALIZATION_REGISTRY = {
   orders = {
     shopee = normalize_shopee_orders,
     tiktok = normalize_tiktok_orders,
+    lazada = normalize_lazada_orders,
   },
   order_detail = {
     shopee = normalize_shopee_orders,
     tiktok = normalize_tiktok_orders,
+    lazada = normalize_lazada_orders,
+  },
+  ship_order = {
+    shopee = normalize_shopee_ship_order,
+    tiktok = normalize_tiktok_ship_order,
   },
 }
 

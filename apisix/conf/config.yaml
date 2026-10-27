@@ -9,6 +9,11 @@ nginx_config:
   http_config:
     access_log: "/dev/stdout"
     error_log: "/dev/stderr info"
+  # Shared dict untuk antrean FIFO webhook (lintas worker), dedup, dan rate
+  # limit — dipakai oleh utils/webhook-queue.lua. Tanpa deklarasi ini,
+  # webhook-queue otomatis degradasi ke kirim langsung (tanpa jaminan urutan).
+  http_configuration_snippet: |
+    lua_shared_dict webhook_queue 32m;
 
 deployment:
   admin:

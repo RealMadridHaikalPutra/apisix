@@ -1,0 +1,238 @@
+══════════════════════════════════════════════════════════════════
+  FULL TEST SUITE — Wed, Jul 29, 2026 10:53:02 PM
+  Gateway: http://localhost:9080
+══════════════════════════════════════════════════════════════════
+
+Configuration:
+  Shopee UUID: 227674818
+  Shopee Product: 802023254
+  TikTok UUID: 7494709429666874412
+  TikTok Product: 1729592969712207008
+  Delay: 3s
+
+[2026-07-29 22:53:02] [STEP] ═════════════════════════════════════════════════════════════
+[2026-07-29 22:53:02] [STEP]   SECTION 1: AUTH ENDPOINTS
+[2026-07-29 22:53:02] [STEP] ═════════════════════════════════════════════════════════════
+[2026-07-29 22:53:02] [INFO] ⏳ Jeda 3s sebelum: Shopee Auth Status...
+[2026-07-29 22:53:06] [STEP] ▶ Auth Status — Shopee
+[2026-07-29 22:53:06] [INFO]   POST http://localhost:9080/auth/status
+
+═══════════════════════════════════════════════════════
+[RESPONSE] unknown | Auth Status — Shopee | HTTP 200
+───────────────────────────────────────────────────────
+{"data":{"needs_refresh":false,"needs_reauth":false,"token_expires_at":1785354703,"refresh_expires_at":null,"has_token":true,"token_expired":false,"refresh_expired":false},"marketplace":"shopee","shop_uuid":"227674818","success":true}
+═══════════════════════════════════════════════════════
+
+[2026-07-29 22:53:07] [PASS] ✓ Auth Status — Shopee
+[2026-07-29 22:53:07] [INFO] ⏳ Jeda 3s sebelum: TikTok Auth Status...
+[2026-07-29 22:53:10] [STEP] ▶ Auth Status — TikTok
+[2026-07-29 22:53:10] [INFO]   POST http://localhost:9080/auth/status
+
+═══════════════════════════════════════════════════════
+[RESPONSE] unknown | Auth Status — TikTok | HTTP 200
+───────────────────────────────────────────────────────
+{"shop_uuid":"7494709429666874412","data":{"needs_refresh":true,"needs_reauth":false,"token_expires_at":1785323679,"refresh_expires_at":4903241615,"has_token":true,"token_expired":true,"refresh_expired":false},"marketplace":"tiktok","success":true}
+═══════════════════════════════════════════════════════
+
+[2026-07-29 22:53:12] [PASS] ✓ Auth Status — TikTok
+[2026-07-29 22:53:12] [INFO] ⏳ Jeda 3s sebelum: Shopee Auth Refresh...
+[2026-07-29 22:53:15] [STEP] ▶ Auth Refresh — Shopee
+[2026-07-29 22:53:15] [INFO]   POST http://localhost:9080/auth/refresh
+
+═══════════════════════════════════════════════════════
+[RESPONSE] unknown | Auth Refresh — Shopee | HTTP 200
+───────────────────────────────────────────────────────
+{"shop_uuid":"227674818","data":{"access_token_expires_at":1785354796,"access_token":"eyJhbGciOiJIUzI1NiJ9.CIG-SxABGMKVyGwgASjsw6jTBjDjhtrzAjgBQAE.bU5e1_5DGFaRYfz6sRU7L1zmL1WeRKrTe8Ouz3MKUW0","refresh_token":"eyJhbGciOiJIUzI1NiJ9.CIG-SxABGMKVyGwgAijsw6jTBjC1w8GhCzgBQAE.-rjCt5Sh1Y2btkLqmamAQ44aq9XPlCBG2EHzUCzaxrY"},"marketplace":"shopee","success":true}
+═══════════════════════════════════════════════════════
+
+[2026-07-29 22:53:17] [PASS] ✓ Auth Refresh — Shopee
+[2026-07-29 22:53:17] [INFO] ⏳ Jeda 3s sebelum: TikTok Auth Refresh...
+[2026-07-29 22:53:21] [STEP] ▶ Auth Refresh — TikTok
+[2026-07-29 22:53:21] [INFO]   POST http://localhost:9080/auth/refresh
+
+═══════════════════════════════════════════════════════
+[RESPONSE] unknown | Auth Refresh — TikTok | HTTP 200
+───────────────────────────────────────────────────────
+{"shop_uuid":"7494709429666874412","data":{"refresh_token_expires_at":4903241615,"access_token_expires_at":1785945201,"access_token":"ROW_Z6Np1QAAAABDrWRBLWhb3mUE-CCvdG7EMb4gQ8kaFgN-6P8ekPkyY6Kufds8n3y5MoELvD0fZTLPTz7VCXpTb9YksaNKhcbj2WIfWKW7LZvA3wsEqL_M5UOdqaQ-r9Ing4SUSXIlCdk6qo4QrWPNKbxxdi9CcLUUclmnC0bXrz3FsAV0QTRdhcUV9qBQc5a98MjyY_KjMsLL-SDKVJKyLiFmQjsgF51f","refresh_token":"ROW_WMHqhQAAAABPmDJQCMwonsi-i-qOkB4veh0zN6L5jpC6l46-ljRZeKWNLxFdgBtPxI65F915djI"},"marketplace":"tiktok","success":true}
+═══════════════════════════════════════════════════════
+
+[2026-07-29 22:53:22] [PASS] ✓ Auth Refresh — TikTok
+[2026-07-29 22:53:23] [STEP] ═════════════════════════════════════════════════════════════
+[2026-07-29 22:53:23] [STEP]   SECTION 2: PRODUCT LIST & SEARCH
+[2026-07-29 22:53:23] [STEP] ═════════════════════════════════════════════════════════════
+[2026-07-29 22:53:23] [INFO] ⏳ Jeda 3s sebelum: Shopee Product List...
+[2026-07-29 22:53:26] [STEP] ▶ Products List — Shopee
+[2026-07-29 22:53:26] [INFO]   GET http://localhost:9080/products?marketplace=shopee&shop_uuid=227674818&page_size=5
+
+═══════════════════════════════════════════════════════
+[RESPONSE] shopee | Products List — Shopee | HTTP 200
+───────────────────────────────────────────────────────
+{"pagination":{"page":1,"page_size":5,"total":3,"has_next":false},"marketplace":"shopee","products":[{"inventory":[{"warehouse_id":"","location_id":"IDZ","available_stock":99,"reserved_stock":0}],"category":"107022","skus":{},"total_available":99,"status":"ACTIVE","description":"Info yang disediakan atau rekomendasi dari Shopee hanya sebagai referensi. Pastikan kamu telah memasukkan info yang sesuai.","external_product_id":"802720223","total_reserved":0,"location_id":"IDZ","product_name":"Diagram","product_image":["https://cf.shopee.co.id/file/id-11134207-81z1k-mr33ltjw77yb6f","https://cf.shopee.co.id/file/id-11134207-81z1k-mr33lwfsgwe97e"]},{"inventory":[],"category":"107022","skus":[{"status":"ACTIVE","total_available_stock":100,"external_variant_id":"14254899771","variant_name":"S","total_reserved_stock":0,"seller_sku":""},{"status":"ACTIVE","total_available_stock":1000,"external_variant_id":"14254899770","variant_name":"M","total_reserved_stock":0,"seller_sku":""}],"total_available":0,"status":"ACTIVE","description":"Info yang disediakan atau rekomendasi dari Shopee hanya sebagai referensi. Pastikan kamu telah memasukkan info yang sesuai.","external_product_id":"844839294","total_reserved":0,"location_id":"","product_name":"Tumor Otak","product_image":["https://cf.shopee.co.id/file/id-11134207-81z1k-mr2zhcso0npdf4","https://cf.shopee.co.id/file/id-11134207-81z1k-mr2zka6ptxj567"]},{"inventory":[],"category":"300168","skus":[{"status":"ACTIVE","total_available_stock":200,"external_variant_id":"11250495","variant_name":"blue","total_reserved_stock":0,"seller_sku":"1A1"},{"status":"ACTIVE","total_available_stock":20000,"external_variant_id":"11250494","variant_name":"red","total_reserved_stock":0,"seller_sku":"1A2"}],"total_available":0,"status":"ACTIVE","description":"Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim","external_product_id":"802023254","total_reserved":0,"location_id":"","product_name":"Logo Mirorim","product_image":["https://cf.shopee.co.id/file/id-11134207-81z1k-mpvu3bnxlvk1b4"]}]}
+═══════════════════════════════════════════════════════
+
+[2026-07-29 22:53:28] [PASS] ✓ Products List — Shopee
+[2026-07-29 22:53:28] [INFO] ⏳ Jeda 3s sebelum: TikTok Product List...
+[2026-07-29 22:53:32] [STEP] ▶ Products List — TikTok
+[2026-07-29 22:53:32] [INFO]   GET http://localhost:9080/products?marketplace=tiktok&shop_uuid=7494709429666874412&page_size=5
+
+═══════════════════════════════════════════════════════
+[RESPONSE] tiktok | Products List — TikTok | HTTP 200
+───────────────────────────────────────────────────────
+{"pagination":{"next_page_token":"WzE3ODQ4MDc1MTA1NjAsIjE3MzY2NzM4Njg1ODM1Njg0MjgiXQ==","page":1,"page_size":5,"total":22,"has_next":true},"marketplace":"tiktok","products":[{"external_product_id":"1736673915168916524","category":"Mobil & Sepeda Motor","skus":[{"external_variant_id":"1736673768485782572","variant_name":null,"seller_sku":"12A4","inventory":[{"warehouse_id":"7650040435037325077","location_id":"7650040435037325077","available_stock":140,"reserved_stock":0}],"status":"ACTIVE"}],"product_name":"AC Dimmer 3000W Pengatur Cahaya Original Premium","status":"INACTIVE","total_reserved":0,"total_available":140,"description":"AC Dimmer 3000W untuk pengaturan intensitas cahaya.","location_id":"","product_image":"https://tos-alisg-i-aphluv4xwc-sg/4a274edf95f6468bb38d8d8a43797062"},{"external_product_id":"1736674150837486636","category":"Kesehatan","skus":[{"external_variant_id":"1736674151257572396","variant_name":null,"seller_sku":"8F14","inventory":[{"warehouse_id":"7650040435037325077","location_id":"7650040435037325077","available_stock":4461,"reserved_stock":0}],"status":"ACTIVE"},{"external_variant_id":"1736674151257637932","variant_name":null,"seller_sku":"8F14-Pack-100","inventory":[{"warehouse_id":"7650040435037325077","location_id":"7650040435037325077","available_stock":44,"reserved_stock":0}],"status":"ACTIVE"}],"product_name":"Kapasitor MLCC 56pf kode 560 Single Pack Original","status":"INACTIVE","total_reserved":0,"total_available":4505,"description":"MLCC Ceramic Capacitor 56pF.","location_id":"","product_image":"https://tos-alisg-i-aphluv4xwc-sg/4a274edf95f6468bb38d8d8a43797062"},{"external_product_id":"1736673832275182636","category":"Kesehatan","skus":[{"external_variant_id":"1736674150434571308","variant_name":null,"seller_sku":"22A4","inventory":[{"warehouse_id":"7650040435037325077","location_id":"7650040435037325077","available_stock":0,"reserved_stock":0}],"status":"ACTIVE"}],"product_name":"VGA RTX 3060 12 GB IGAME SERIES GAMING PREMIUM","status":"INACTIVE","total_reserved":0,"total_available":0,"description":"NVIDIA GeForce RTX 3060 12GB.","location_id":"","product_image":"https://tos-alisg-i-aphluv4xwc-sg/4a274edf95f6468bb38d8d8a43797062"},{"external_product_id":"1736674150160958508","category":"Mobil & Sepeda Motor","skus":[{"external_variant_id":"1736674150853608492","variant_name":null,"seller_sku":"2A4-100s","inventory":[{"warehouse_id":"7650040435037325077","location_id":"7650040435037325077","available_stock":14,"reserved_stock":0}],"status":"ACTIVE"},{"external_variant_id":"1736674150853674028","variant_name":null,"seller_sku":"2A4-20s","inventory":[{"warehouse_id":"7650040435037325077","location_id":"7650040435037325077","available_stock":15,"reserved_stock":0}],"status":"ACTIVE"},{"external_variant_id":"1736674150853739564","variant_name":null,"seller_sku":"2A4-20x","inventory":[{"warehouse_id":"7650040435037325077","location_id":"7650040435037325077","available_stock":300,"reserved_stock":0}],"status":"ACTIVE"},{"external_variant_id":"1736674150853805100","variant_name":null,"seller_sku":"2A4-5s","inventory":[{"warehouse_id":"7650040435037325077","location_id":"7650040435037325077","available_stock":0,"reserved_stock":0}],"status":"ACTIVE"}],"product_name":"C. Buaya Mrh. S. Original 100s/20s/20x/5s Premium","status":"INACTIVE","total_reserved":0,"total_available":329,"description":"Komponen elektronik original.","location_id":"","product_image":"https://tos-alisg-i-aphluv4xwc-sg/4a274edf95f6468bb38d8d8a43797062"},{"external_product_id":"1736673868583568428","category":"Mobil & Sepeda Motor","skus":[{"external_variant_id":"1736673867911300140","variant_name":null,"seller_sku":"12A4","inventory":[{"warehouse_id":"7650040435037325077","location_id":"7650040435037325077","available_stock":140,"reserved_stock":0}],"status":"ACTIVE"}],"product_name":"AC Dimmer 3000W Pengatur Cahaya Original Premium","status":"INACTIVE","total_reserved":0,"total_available":140,"description":"AC Dimmer 3000W untuk pengaturan intensitas cahaya.","location_id":"","product_image":"https://tos-alisg-i-aphluv4xwc-sg/4a274edf95f6468bb38d8d8a43797062"}]}
+═══════════════════════════════════════════════════════
+
+[2026-07-29 22:53:37] [PASS] ✓ Products List — TikTok
+[2026-07-29 22:53:37] [INFO] ⏳ Jeda 3s sebelum: Shopee Product Filter by Status...
+[2026-07-29 22:53:40] [STEP] ▶ Products List (status=ACTIVE) — Shopee
+[2026-07-29 22:53:40] [INFO]   GET http://localhost:9080/products?marketplace=shopee&shop_uuid=227674818&status=ACTIVE&page_size=5
+
+═══════════════════════════════════════════════════════
+[RESPONSE] shopee | Products List (status=ACTIVE) — Shopee | HTTP 200
+───────────────────────────────────────────────────────
+{"pagination":{"total":3,"page":1,"page_size":5,"has_next":false},"marketplace":"shopee","products":[{"skus":{},"total_available":99,"product_image":["https://cf.shopee.co.id/file/id-11134207-81z1k-mr33ltjw77yb6f","https://cf.shopee.co.id/file/id-11134207-81z1k-mr33lwfsgwe97e"],"location_id":"IDZ","status":"ACTIVE","category":"107022","total_reserved":0,"inventory":[{"available_stock":99,"reserved_stock":0,"warehouse_id":"","location_id":"IDZ"}],"description":"Info yang disediakan atau rekomendasi dari Shopee hanya sebagai referensi. Pastikan kamu telah memasukkan info yang sesuai.","external_product_id":"802720223","product_name":"Diagram"},{"skus":[{"variant_name":"M","total_reserved_stock":0,"total_available_stock":1000,"status":"ACTIVE","seller_sku":"","external_variant_id":"14254899770"},{"variant_name":"S","total_reserved_stock":0,"total_available_stock":100,"status":"ACTIVE","seller_sku":"","external_variant_id":"14254899771"}],"total_available":0,"product_image":["https://cf.shopee.co.id/file/id-11134207-81z1k-mr2zhcso0npdf4","https://cf.shopee.co.id/file/id-11134207-81z1k-mr2zka6ptxj567"],"location_id":"","status":"ACTIVE","category":"107022","total_reserved":0,"inventory":[],"description":"Info yang disediakan atau rekomendasi dari Shopee hanya sebagai referensi. Pastikan kamu telah memasukkan info yang sesuai.","external_product_id":"844839294","product_name":"Tumor Otak"},{"skus":[{"variant_name":"red","total_reserved_stock":0,"total_available_stock":20000,"status":"ACTIVE","seller_sku":"1A2","external_variant_id":"11250494"},{"variant_name":"blue","total_reserved_stock":0,"total_available_stock":200,"status":"ACTIVE","seller_sku":"1A1","external_variant_id":"11250495"}],"total_available":0,"product_image":["https://cf.shopee.co.id/file/id-11134207-81z1k-mpvu3bnxlvk1b4"],"location_id":"","status":"ACTIVE","category":"300168","total_reserved":0,"inventory":[],"description":"Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim","external_product_id":"802023254","product_name":"Logo Mirorim"}]}
+═══════════════════════════════════════════════════════
+
+[2026-07-29 22:53:46] [PASS] ✓ Products List (status=ACTIVE) — Shopee
+[2026-07-29 22:53:46] [INFO] ⏳ Jeda 3s sebelum: TikTok Product Filter by Status...
+[2026-07-29 22:53:49] [STEP] ▶ Products List (status=ACTIVE) — TikTok
+[2026-07-29 22:53:49] [INFO]   GET http://localhost:9080/products?marketplace=tiktok&shop_uuid=7494709429666874412&status=ACTIVE&page_size=5
+
+═══════════════════════════════════════════════════════
+[RESPONSE] tiktok | Products List (status=ACTIVE) — TikTok | HTTP 200
+───────────────────────────────────────────────────────
+{"pagination":{"total":4,"page":1,"page_size":5,"has_next":true,"next_page_token":"WzE3ODQ4MDM0MTg1NDMsIjE3MzY2NzI3NDUwNTgxNzM5OTYiXQ=="},"marketplace":"tiktok","products":[{"skus":[{"status":"ACTIVE","external_variant_id":"1736672744728265772","variant_name":null,"seller_sku":"12A4","inventory":[{"available_stock":194,"reserved_stock":0,"warehouse_id":"7650040435037325077","location_id":"7650040435037325077"}]}],"product_image":"https://tos-alisg-i-aphluv4xwc-sg/4a274edf95f6468bb38d8d8a43797062","total_available":194,"category":"Mobil & Sepeda Motor","location_id":"","status":"ACTIVE","total_reserved":0,"description":"AC Dimmer 3000W untuk pengaturan intensitas cahaya.","external_product_id":"1736672569507808300","product_name":"AC Dimmer 3000W Pengatur Cahaya Original Premium"},{"skus":[{"status":"ACTIVE","external_variant_id":"1736672772166288428","variant_name":null,"seller_sku":"8F14","inventory":[{"available_stock":4461,"reserved_stock":0,"warehouse_id":"7650040435037325077","location_id":"7650040435037325077"}]},{"status":"ACTIVE","external_variant_id":"1736672772166353964","variant_name":null,"seller_sku":"8F14-Pack-100","inventory":[{"available_stock":13,"reserved_stock":0,"warehouse_id":"7650040435037325077","location_id":"7650040435037325077"}]}],"product_image":"https://tos-alisg-i-aphluv4xwc-sg/4a274edf95f6468bb38d8d8a43797062","total_available":4474,"category":"Kesehatan","location_id":"","status":"ACTIVE","total_reserved":0,"description":"MLCC Ceramic Capacitor 56pF.","external_product_id":"1736672569117213740","product_name":"Kapasitor MLCC 56pf kode 560 Single Pack Original"},{"skus":[{"status":"ACTIVE","external_variant_id":"1736672787534808108","variant_name":null,"seller_sku":"22A4","inventory":[{"available_stock":2,"reserved_stock":0,"warehouse_id":"7650040435037325077","location_id":"7650040435037325077"},{"available_stock":200,"reserved_stock":0,"warehouse_id":"7665188561377756929","location_id":"7665188561377756929"}]}],"product_image":"https://tos-alisg-i-aphluv4xwc-sg/4a274edf95f6468bb38d8d8a43797062","total_available":202,"category":"Kesehatan","location_id":"","status":"ACTIVE","total_reserved":0,"description":"NVIDIA GeForce RTX 3060 12GB.","external_product_id":"1736672782980383788","product_name":"VGA RTX 3060 12 GB IGAME SERIES GAMING PREMIUM"},{"skus":[{"status":"ACTIVE","external_variant_id":"1736672744536507436","variant_name":null,"seller_sku":"2A4-100s","inventory":[{"available_stock":11,"reserved_stock":0,"warehouse_id":"7650040435037325077","location_id":"7650040435037325077"}]},{"status":"ACTIVE","external_variant_id":"1736672744536572972","variant_name":null,"seller_sku":"2A4-20s","inventory":[{"available_stock":7,"reserved_stock":0,"warehouse_id":"7650040435037325077","location_id":"7650040435037325077"}]},{"status":"ACTIVE","external_variant_id":"1736672744536638508","variant_name":null,"seller_sku":"2A4-20x","inventory":[{"available_stock":14,"reserved_stock":0,"warehouse_id":"7650040435037325077","location_id":"7650040435037325077"}]},{"status":"ACTIVE","external_variant_id":"1736672744536704044","variant_name":null,"seller_sku":"2A4-5s","inventory":[{"available_stock":1,"reserved_stock":0,"warehouse_id":"7650040435037325077","location_id":"7650040435037325077"}]}],"product_image":"https://tos-alisg-i-aphluv4xwc-sg/4a274edf95f6468bb38d8d8a43797062","total_available":33,"category":"Mobil & Sepeda Motor","location_id":"","status":"ACTIVE","total_reserved":0,"description":"Komponen elektronik original.","external_product_id":"1736672745058173996","product_name":"C. Buaya Mrh. S. Original 100s/20s/20x/5s Premium"}]}
+═══════════════════════════════════════════════════════
+
+[2026-07-29 22:53:53] [PASS] ✓ Products List (status=ACTIVE) — TikTok
+[2026-07-29 22:53:53] [INFO] ⏳ Jeda 3s sebelum: Shopee Product Search by Keyword...
+[2026-07-29 22:53:56] [STEP] ▶ Products Search (keyword) — Shopee
+[2026-07-29 22:53:56] [INFO]   GET http://localhost:9080/products?marketplace=shopee&shop_uuid=227674818&keyword=test&page_size=5
+
+═══════════════════════════════════════════════════════
+[RESPONSE] shopee | Products Search (keyword) — Shopee | HTTP 200
+───────────────────────────────────────────────────────
+{"pagination":{"page":1,"page_size":5,"total":3,"has_next":false},"marketplace":"shopee","products":[{"total_reserved":0,"skus":{},"inventory":[{"warehouse_id":"","location_id":"IDZ","available_stock":99,"reserved_stock":0}],"total_available":99,"status":"ACTIVE","external_product_id":"802720223","product_name":"Diagram","location_id":"IDZ","description":"Info yang disediakan atau rekomendasi dari Shopee hanya sebagai referensi. Pastikan kamu telah memasukkan info yang sesuai.","category":"107022","product_image":["https://cf.shopee.co.id/file/id-11134207-81z1k-mr33ltjw77yb6f","https://cf.shopee.co.id/file/id-11134207-81z1k-mr33lwfsgwe97e"]},{"total_reserved":0,"skus":[{"status":"ACTIVE","total_available_stock":100,"seller_sku":"","total_reserved_stock":0,"external_variant_id":"14254899771","variant_name":"S"},{"status":"ACTIVE","total_available_stock":1000,"seller_sku":"","total_reserved_stock":0,"external_variant_id":"14254899770","variant_name":"M"}],"inventory":[],"total_available":0,"status":"ACTIVE","external_product_id":"844839294","product_name":"Tumor Otak","location_id":"","description":"Info yang disediakan atau rekomendasi dari Shopee hanya sebagai referensi. Pastikan kamu telah memasukkan info yang sesuai.","category":"107022","product_image":["https://cf.shopee.co.id/file/id-11134207-81z1k-mr2zhcso0npdf4","https://cf.shopee.co.id/file/id-11134207-81z1k-mr2zka6ptxj567"]},{"total_reserved":0,"skus":[{"status":"ACTIVE","total_available_stock":200,"seller_sku":"1A1","total_reserved_stock":0,"external_variant_id":"11250495","variant_name":"blue"},{"status":"ACTIVE","total_available_stock":20000,"seller_sku":"1A2","total_reserved_stock":0,"external_variant_id":"11250494","variant_name":"red"}],"inventory":[],"total_available":0,"status":"ACTIVE","external_product_id":"802023254","product_name":"Logo Mirorim","location_id":"","description":"Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim","category":"300168","product_image":["https://cf.shopee.co.id/file/id-11134207-81z1k-mpvu3bnxlvk1b4"]}]}
+═══════════════════════════════════════════════════════
+
+[2026-07-29 22:53:58] [PASS] ✓ Products Search (keyword) — Shopee
+[2026-07-29 22:53:58] [STEP] ═════════════════════════════════════════════════════════════
+[2026-07-29 22:53:59] [STEP]   SECTION 3: PRODUCT DETAIL
+[2026-07-29 22:53:59] [STEP] ═════════════════════════════════════════════════════════════
+[2026-07-29 22:53:59] [INFO] ⏳ Jeda 3s sebelum: Shopee Product Detail...
+[2026-07-29 22:54:02] [STEP] ▶ Product Detail — Shopee
+[2026-07-29 22:54:02] [INFO]   GET http://localhost:9080/products/802023254?marketplace=shopee&shop_uuid=227674818
+
+═══════════════════════════════════════════════════════
+[RESPONSE] shopee | Product Detail — Shopee | HTTP 200
+───────────────────────────────────────────────────────
+{"raw_response":{"response":{"item_list":[{"purchase_limit_info":{"min_purchase_limit":1},"weight":"0.01","size_chart":"","tag":{"kit":false},"logistic_info":[{"logistic_id":80053,"logistic_name":"SPX Instant","enabled":false,"size_id":0,"is_free":false,"estimated_shipping_fee":12000},{"logistic_id":80054,"logistic_name":"SPX Instant Prioritas","enabled":false,"size_id":0,"is_free":false,"estimated_shipping_fee":15000},{"logistic_id":81016,"logistic_name":"Sandbox-J&T Cargo(Don't modify)","enabled":true,"size_id":0,"is_free":false,"estimated_shipping_fee":11765},{"logistic_id":81017,"logistic_name":"Sandbox-J&T Express(Don't modify)","enabled":false,"size_id":0,"is_free":false,"estimated_shipping_fee":11765}],"condition":"NEW","update_time":1782366590,"item_name":"Logo Mirorim","attribute_list":[{"attribute_id":200121,"original_attribute_name":"[S]Warranty Duration","is_mandatory":true,"attribute_value_list":[{"value_id":105577,"value_unit":"","original_value_name":"[S]No Warranty"}]},{"attribute_id":200370,"original_attribute_name":"[S]Warranty Type","is_mandatory":true,"attribute_value_list":[{"value_id":105576,"value_unit":"","original_value_name":"[S]No Warranty"}]}],"create_time":1782366590,"pre_order":{"is_pre_order":false,"days_to_ship":2},"has_model":true,"has_promotion":false,"item_sku":"","dimension":{"package_height":0,"package_length":0,"package_width":0},"item_dangerous":0,"description_info":{"extended_description":{"field_list":[{"field_type":"text","text":"Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim Logo Mirorim "}]}},"image":{"image_url_list":["https://cf.shopee.co.id/file/id-11134207-81z1k-mpvu3bnxlvk1b4"],"image_id_list":["id-11134207-81z1k-mpvu3bnxlvk1b4"],"image_ratio":"1:1"},"deboost":"FALSE","brand":{"original_brand_name":"NoBrand","brand_id":0},"item_status":"NORMAL","category_id":300168,"description_type":"extended","size_chart_id":0,"promotion_image":{"image_id_list":["id-11134207-81z1k-mpvu3bnxlvk1b4"],"image_url_list":["https://cf.shopee.co.id/file/id-11134207-81z1k-mpvu3bnxlvk1b4"]},"item_id":802023254,"compatibility_info":{},"authorised_brand_id":0,"is_fulfillment_by_shopee":false}]},"error":"","debug_message":"","message":"","warning":"","request_id":"e3e3e7f357c1f6e544c8da1c1cbf6600"},"marketplace":"shopee"}
+═══════════════════════════════════════════════════════
+
+[2026-07-29 22:54:04] [PASS] ✓ Product Detail — Shopee
+[2026-07-29 22:54:04] [INFO] ⏳ Jeda 3s sebelum: TikTok Product Detail...
+[2026-07-29 22:54:07] [STEP] ▶ Product Detail — TikTok
+[2026-07-29 22:54:07] [INFO]   GET http://localhost:9080/products/1729592969712207008?marketplace=tiktok&shop_uuid=7494709429666874412
+
+═══════════════════════════════════════════════════════
+[RESPONSE] tiktok | Product Detail — TikTok | HTTP 200
+───────────────────────────────────────────────────────
+{"raw_response":{"code":12052032,"data":null,"request_id":"202607292354074D80D697EC753E0775C9","message":"This product does not exist. Nonexistent product ID(s): "},"marketplace":"tiktok"}
+═══════════════════════════════════════════════════════
+
+[2026-07-29 22:54:09] [PASS] ✓ Product Detail — TikTok
+[2026-07-29 22:54:09] [WARN] SECTION 4: SKIP — Create products (--quick mode)
+[2026-07-29 22:54:09] [STEP] ═════════════════════════════════════════════════════════════
+[2026-07-29 22:54:09] [STEP]   SECTION 5: UPDATE STOCK
+[2026-07-29 22:54:09] [STEP] ═════════════════════════════════════════════════════════════
+[2026-07-29 22:54:09] [INFO] ⏳ Jeda 3s sebelum: Shopee Update Stock (Legacy)...
+[2026-07-29 22:54:12] [STEP] ▶ Update Stock (Legacy) — Shopee
+[2026-07-29 22:54:12] [INFO]   POST http://localhost:9080/update-stock/802023254?marketplace=shopee&shop_uuid=227674818
+
+═══════════════════════════════════════════════════════
+[RESPONSE] shopee | Update Stock (Legacy) — Shopee | HTTP 200
+───────────────────────────────────────────────────────
+{"raw_response":{"response":{"success_list":[],"failure_list":[{"failed_reason":"model_id is mandatory if item is under model level, please input the model_id of the models that need to be update"}]},"debug_message":"","error":"","warning":"","message":"","request_id":"e3e3e7f357c1f784570fd0ad7cbfb100"},"marketplace":"shopee"}
+═══════════════════════════════════════════════════════
+
+[2026-07-29 22:54:14] [PASS] ✓ Update Stock (Legacy) — Shopee
+[2026-07-29 22:54:14] [INFO] ⏳ Jeda 3s sebelum: Shopee Update Stock (Native)...
+[2026-07-29 22:54:17] [STEP] ▶ Update Stock (Native) — Shopee
+[2026-07-29 22:54:18] [INFO]   POST http://localhost:9080/update-stock/802023254?marketplace=shopee&shop_uuid=227674818
+
+═══════════════════════════════════════════════════════
+[RESPONSE] shopee | Update Stock (Native) — Shopee | HTTP 200
+───────────────────────────────────────────────────────
+{"raw_response":{"response":{"failure_list":[{"failed_reason":"model_id is mandatory if item is under model level, please input the model_id of the models that need to be update"}],"success_list":[]},"error":"","debug_message":"","warning":"","message":"","request_id":"e3e3e7f357c1f7d15205e9560b79aa00"},"marketplace":"shopee"}
+═══════════════════════════════════════════════════════
+
+[2026-07-29 22:54:19] [PASS] ✓ Update Stock (Native) — Shopee
+[2026-07-29 22:54:19] [INFO] ⏳ Jeda 3s sebelum: TikTok Update Stock (Legacy)...
+[2026-07-29 22:54:22] [STEP] ▶ Update Stock (Legacy) — TikTok
+[2026-07-29 22:54:22] [INFO]   POST http://localhost:9080/update-stock/1729592969712207008?marketplace=tiktok&shop_uuid=7494709429666874412
+
+═══════════════════════════════════════════════════════
+[RESPONSE] tiktok | Update Stock (Legacy) — TikTok | HTTP 200
+───────────────────────────────────────────────────────
+{"raw_response":{"code":12052032,"data":null,"request_id":"202607292354233395B4FC6E70D508006F","message":"The product does not exist"},"marketplace":"tiktok"}
+═══════════════════════════════════════════════════════
+
+[2026-07-29 22:54:24] [PASS] ✓ Update Stock (Legacy) — TikTok
+[2026-07-29 22:54:24] [INFO] ⏳ Jeda 3s sebelum: TikTok Update Stock (Native)...
+[2026-07-29 22:54:28] [STEP] ▶ Update Stock (Native) — TikTok
+[2026-07-29 22:54:28] [INFO]   POST http://localhost:9080/update-stock/1729592969712207008?marketplace=tiktok&shop_uuid=7494709429666874412
+
+═══════════════════════════════════════════════════════
+[RESPONSE] tiktok | Update Stock (Native) — TikTok | HTTP 200
+───────────────────────────────────────────────────────
+{"raw_response":{"code":12052032,"data":null,"request_id":"20260729235428CC83CFB9CA8D6708E8FC","message":"The product does not exist"},"marketplace":"tiktok"}
+═══════════════════════════════════════════════════════
+
+[2026-07-29 22:54:29] [PASS] ✓ Update Stock (Native) — TikTok
+[2026-07-29 22:54:29] [STEP] ═════════════════════════════════════════════════════════════
+[2026-07-29 22:54:29] [STEP]   SECTION 6: UPDATE PRODUCT STATUS
+[2026-07-29 22:54:29] [STEP] ═════════════════════════════════════════════════════════════
+[2026-07-29 22:54:29] [INFO] ⏳ Jeda 3s sebelum: Shopee Activate Product...
+[2026-07-29 22:54:33] [STEP] ▶ Activate Product — Shopee
+[2026-07-29 22:54:33] [INFO]   POST http://localhost:9080/update-status/802023254?marketplace=shopee&shop_uuid=227674818
+
+═══════════════════════════════════════════════════════
+[RESPONSE] shopee | Activate Product — Shopee | HTTP 200
+───────────────────────────────────────────────────────
+{"status":"ACTIVE","action":"update_status","raw_response":{"error":"product.error_busi","debug_message":"Failed to update product : validation: [Rule Type: media.image.quantity.range, Detail: {\"actual_value\":1,\"upper_limit\":9,\"lower_limit\":2}] ","message":"The number of product images must be between 2 and 9. Please adjust it.","warning":"","request_id":"e3e3e7f357c1f8bb465bf93cabfcbd00"},"marketplace":"shopee"}
+═══════════════════════════════════════════════════════
+
+[2026-07-29 22:54:35] [PASS] ✓ Activate Product — Shopee
+[2026-07-29 22:54:35] [INFO] ⏳ Jeda 3s sebelum: Shopee Deactivate Product...
+[2026-07-29 22:54:38] [STEP] ▶ Deactivate Product — Shopee
+[2026-07-29 22:54:38] [INFO]   POST http://localhost:9080/update-status/802023254?marketplace=shopee&shop_uuid=227674818
+
+═══════════════════════════════════════════════════════
+[RESPONSE] shopee | Deactivate Product — Shopee | HTTP 200
+───────────────────────────────────────────────────────
+{"status":"INACTIVE","action":"update_status","marketplace":"shopee","raw_response":{"error":"product.error_busi","warning":"","message":"The number of product images must be between 2 and 9. Please adjust it.","debug_message":"Failed to update product : validation: [Rule Type: media.image.quantity.range, Detail: {\"actual_value\":1,\"upper_limit\":9,\"lower_limit\":2}] ","request_id":"e3e3e7f357c1f90c31a28148bf8d1d00"}}
+═══════════════════════════════════════════════════════
+
+[2026-07-29 22:54:40] [PASS] ✓ Deactivate Product — Shopee
+[2026-07-29 22:54:40] [INFO] ⏳ Jeda 3s sebelum: Shopee Reactivate Product...
+[2026-07-29 22:54:43] [STEP] ▶ Reactivate Product — Shopee
+[2026-07-29 22:54:43] [INFO]   POST http://localhost:9080/update-status/802023254?marketplace=shopee&shop_uuid=227674818
+
+═══════════════════════════════════════════════════════
+[RESPONSE] shopee | Reactivate Product — Shopee | HTTP 200
+───────────────────────────────────────────────────────
+{"status":"ACTIVE","action":"update_status","raw_response":{"error":"product.error_busi","debug_message":"Failed to update product : validation: [Rule Type: media.image.quantity.range, Detail: {\"actual_value\":1,\"upper_limit\":9,\"lower_limit\":2}] ","warning":"","message":"The number of product images must be between 2 and 9. Please adjust it.","request_id":"e3e3e7f357c1f95aaf611e2ea95f2600"},"marketplace":"shopee"}
+═══════════════════════════════════════════════════════
+
+[2026-07-29 22:54:45] [PASS] ✓ Reactivate Product — Shopee
+[2026-07-29 22:54:45] [INFO] ⏳ Jeda 3s sebelum: TikTok Activate Product (Single)...
+[2026-07-29 22:54:48] [STEP] ▶ Activate Product (Single) — TikTok
+[2026-07-29 22:54:48] [INFO]   POST http://localhost:9080/update-status/1729592969712207008?marketplace=tiktok&shop_uuid=7494709429666874412
+
+═══════════════════════════════════════════════════════
+[RESPONSE] tiktok | Activate Product (Single) — TikTok | HTTP 400
+───────────────────────────────────────────────────────
+{"error":{"code":"ENDPOINT_NOT_SUPPORTED","message":"endpoint 'update_status' not supported for marketplace 'tiktok'"}}
+═══════════════════════════════════════════════════════
+
+[2026-07-29 22:54:50] [FAIL] ✗ Activate Product (Single) — TikTok — expected pattern 'raw_response' not found
+[2026-07-29 22:54:50] [FAIL]   HTTP Status: 400

@@ -61,9 +61,28 @@ end
 -- @param credentials - Combined credentials table
 -- @return table - Shopee query parameters
 local function shopee_product_detail(params, credentials)
+  local raw_product_id = params and params.product_id
+  local item_id_list = raw_product_id
+
+  if type(raw_product_id) == "table" then
+    local ids = {}
+    for _, id in ipairs(raw_product_id) do
+      ids[#ids + 1] = tostring(id)
+    end
+    item_id_list = table.concat(ids, ",")
+  else
+    item_id_list = tostring(raw_product_id or "")
+  end
+
+  if item_id_list == "" then
+    return {
+      shop_id = credentials.shop_id,
+    }
+  end
+
   local detail_params = {
     shop_id = credentials.shop_id,
-    item_id_list = params.product_id,
+    item_id_list = item_id_list,
   }
 
   -- Optional params from Postman config for richer product info
@@ -850,6 +869,17 @@ local function tiktok_products_body(params)
     body.seller_skus = { params.keyword }
   end
 
+  -- listing_platforms (optional): forward as a TikTok Search Products body
+  -- filter. Useful for Tokopedia-migrated sellers to restrict the search to a
+  -- specific platform (e.g. only TIKTOK_SHOP, or only TOKOPEDIA).
+  -- Accepted via query param (?listing_platforms=TIKTOK_SHOP) or POST body
+  -- ({"listing_platforms": ["TIKTOK_SHOP"]}) — already normalized to an
+  -- uppercased string array by request-transformer.parse_listing_platforms.
+  if params.listing_platforms and type(params.listing_platforms) == "table"
+      and #params.listing_platforms > 0 then
+    body.listing_platforms = params.listing_platforms
+  end
+
   local ok, json = pcall(cjson.encode, body)
   if ok then
     return json
@@ -1095,17 +1125,839 @@ local function shopee_order_detail(params, credentials)
   return q
 end
 
+-- ── Standardized Request Pickup / Ship Order ─────────────────────────────
+--
+-- Client mengirim SATU bentuk request body standar untuk Shopee & TikTok:
+--
+--   {
+--     "order_id": "ORDER_ATAU_PACKAGE_ID",
+--     "handover_method": "PICKUP" | "DROP_OFF" | "NON_INTEGRATED" | "SELF_SHIPMENT",
+--     "package_number": "...",                        -- opsional (Shopee split order)
+--     "pickup": {
+--       "address_id": 123456,                         -- Shopee
+--       "time_slot_id": "slot-id",                    -- Shopee (opsional)
+--       "start_time": 1718000000,                     -- TikTok (Unix detik)
+--       "end_time": 1718007200
+--     },
+--     "dropoff": { "branch_id": 1, "sender_real_name": "...", "slug": "...", "tracking_number": "..." },
+--     "non_integrated": { "tracking_number": "..." },
+--     "self_shipment": { "tracking_number": "...", "shipping_provider_id": "..." }
+--   }
+--
+-- Field flat (address_id, pickup_time_id, start_time, end_time,
+-- tracking_number, branch_id, sender_real_name, slug, ...) tetap didukung
+-- agar request lama tidak rusak. Gateway menormalkan metode lalu memilih
+-- bentuk native yang benar untuk masing-masing marketplace.
+
+-- SEMUA mapping variabel ship_order dibaca dari update-config.json:
+--   endpoints.ship_order.handover_aliases
+--   endpoints.ship_order.infer_order
+--   endpoints.ship_order.<marketplace>.api
+--   endpoints.ship_order.<marketplace>.request_map
+-- Fallback di bawah hanya dipakai bila file config tidak tersedia.
+local DEFAULT_HANDOVER_ALIASES = {
+  PICKUP             = "PICKUP",
+  PICK_UP            = "PICKUP",
+  ["PICK-UP"]        = "PICKUP",
+  DROP_OFF           = "DROP_OFF",
+  DROPOFF            = "DROP_OFF",
+  ["DROP-OFF"]       = "DROP_OFF",
+  NON_INTEGRATED     = "NON_INTEGRATED",
+  NONINTEGRATED      = "NON_INTEGRATED",
+  ["NON-INTEGRATED"] = "NON_INTEGRATED",
+  SELF_SHIPMENT      = "SELF_SHIPMENT",
+  SELF_SHIPPED       = "SELF_SHIPMENT",
+  SELF_SHIP          = "SELF_SHIPMENT",
+}
+
+local DEFAULT_INFER_ORDER = { "PICKUP", "DROP_OFF", "NON_INTEGRATED", "SELF_SHIPMENT" }
+
+local DEFAULT_INFER_SOURCES = {
+  PICKUP = {
+    "pickup", "pickup_slot", "address_id", "pickup_time_id",
+    "time_slot_id", "start_time", "end_time",
+  },
+  DROP_OFF = { "dropoff", "branch_id", "sender_real_name", "slug" },
+  NON_INTEGRATED = { "non_integrated" },
+  SELF_SHIPMENT = { "self_shipment" },
+}
+
+--- Konfigurasi endpoint ship_order dari update-config.json.
+local function get_ship_order_endpoint_config()
+  local ep = update_config.get_endpoint_config("ship_order")
+  if type(ep) ~= "table" then
+    return {}
+  end
+  return ep
+end
+
+--- Ambil nilai nested berdasarkan dot-path ("pickup.address_id").
+local function get_path(source, path)
+  if type(source) ~= "table" or type(path) ~= "string" then
+    return nil
+  end
+
+  local current = source
+  for part in path:gmatch("[^.]+") do
+    if type(current) ~= "table" then
+      return nil
+    end
+    current = current[part]
+  end
+
+  return current
+end
+
+--- True jika value adalah tabel JSON yang berisi minimal satu key.
+-- Dipakai oleh builder fallback lama.
+local function has_table(value)
+  return type(value) == "table" and next(value) ~= nil
+end
+
+--- Ambil nilai sumber rule dari body standar atau params (prefix "@").
+local function get_source_value(body_data, params, source)
+  if type(source) ~= "string" then
+    return nil
+  end
+  if source:sub(1, 1) == "@" then
+    return get_path(params or {}, source:sub(2))
+  end
+  return get_path(body_data, source)
+end
+
+--- Ambil nilai pertama yang tersedia dari `sources` sebuah rule config.
+local function resolve_rule_value(body_data, rule, params)
+  if type(rule) ~= "table" then
+    return nil
+  end
+
+  -- Nilai literal (mis. handover_method = "PICKUP")
+  if rule.value ~= nil then
+    return rule.value
+  end
+
+  if type(rule.sources) ~= "table" then
+    return nil
+  end
+
+  for _, source in ipairs(rule.sources) do
+    local value = get_source_value(body_data, params, source)
+    if value ~= nil and value ~= cjson.null and value ~= "" then
+      return value
+    end
+  end
+
+  return nil
+end
+
+--- Set nilai nested berdasarkan dot-path, membuat tabel antara bila perlu.
+local function set_path(target, path, value)
+  local parts = {}
+  for part in path:gmatch("[^.]+") do
+    parts[#parts + 1] = part
+  end
+  if #parts == 0 then
+    return
+  end
+
+  local current = target
+  for i = 1, #parts - 1 do
+    local part = parts[i]
+    if type(current[part]) ~= "table" then
+      current[part] = {}
+    end
+    current = current[part]
+  end
+
+  current[parts[#parts]] = value
+end
+
+--- Normalisasi handover_method memakai alias dari JSON.
+-- @param value - Nilai dari request body (string)
+-- @param marketplace - (Optional) Marketplace tujuan
+-- @return string|nil - PICKUP / DROP_OFF / NON_INTEGRATED / SELF_SHIPMENT
+function _M.normalize_handover_method(value, marketplace)
+  if value == nil or value == cjson.null then
+    return nil
+  end
+
+  local ep = get_ship_order_endpoint_config()
+  local aliases = type(ep.handover_aliases) == "table" and ep.handover_aliases
+      or DEFAULT_HANDOVER_ALIASES
+
+  local key = tostring(value):upper():gsub("%s+", "_")
+  return aliases[key]
+end
+
+--- Tentukan metode handover efektif dari body standar.
+-- Prioritas: handover_method eksplisit, lalu inferensi dari field sumber
+-- yang dideklarasikan di JSON (`*.infer_sources`).
+-- @param body_data - Parsed request body
+-- @param marketplace - (Optional) Marketplace tujuan
+-- @return string|nil, string|nil - (method, error_message)
+function _M.resolve_handover_method(body_data, marketplace)
+  if type(body_data) ~= "table" then
+    return nil, "request body must be a JSON object"
+  end
+
+  local raw = body_data.handover_method
+  if raw ~= nil and raw ~= cjson.null and tostring(raw) ~= "" then
+    local normalized = _M.normalize_handover_method(raw, marketplace)
+    if not normalized then
+      return nil, "unsupported handover_method '" .. tostring(raw)
+          .. "' (allowed: PICKUP, DROP_OFF, NON_INTEGRATED, SELF_SHIPMENT)"
+    end
+    return normalized
+  end
+
+  local ep = get_ship_order_endpoint_config()
+  local infer_order = type(ep.infer_order) == "table" and ep.infer_order
+      or DEFAULT_INFER_ORDER
+
+  local mp_cfg = marketplace and ep[marketplace] or nil
+  local request_map = type(mp_cfg) == "table" and mp_cfg.request_map or nil
+  local methods = type(request_map) == "table" and request_map.methods or nil
+
+  for _, method in ipairs(infer_order) do
+    local method_cfg = type(methods) == "table" and methods[method] or nil
+    local sources = type(method_cfg) == "table" and method_cfg.infer_sources or nil
+    if type(sources) ~= "table" then
+      sources = DEFAULT_INFER_SOURCES[method]
+    end
+
+    for _, source in ipairs(sources or {}) do
+      local value = get_path(body_data, source)
+      if value ~= nil and value ~= cjson.null and value ~= "" then
+        if type(value) ~= "table" or next(value) ~= nil then
+          return method
+        end
+      end
+    end
+  end
+
+  return nil
+end
+
+--- Resolve slot waktu pickup (Unix detik) dari body standar.
+-- Sumber field dibaca dari request_map.methods.PICKUP di JSON.
+-- @return number|nil, number|nil - (start_time, end_time)
+function _M.resolve_pickup_times(body_data, marketplace)
+  if type(body_data) ~= "table" then
+    return nil, nil
+  end
+
+  marketplace = marketplace or "tiktok"
+
+  local ep = get_ship_order_endpoint_config()
+  local mp_cfg = ep[marketplace]
+  local request_map = type(mp_cfg) == "table" and mp_cfg.request_map or nil
+  local methods = type(request_map) == "table" and request_map.methods or nil
+  local pickup_cfg = type(methods) == "table" and methods.PICKUP or nil
+  local fields = type(pickup_cfg) == "table" and pickup_cfg.fields or nil
+
+  if type(fields) == "table" then
+    local start, finish
+    for _, rule in ipairs(fields) do
+      if rule.target == "pickup_slot.start_time" then
+        start = tonumber(resolve_rule_value(body_data, rule))
+      elseif rule.target == "pickup_slot.end_time" then
+        finish = tonumber(resolve_rule_value(body_data, rule))
+      end
+    end
+    return start, finish
+  end
+
+  -- Fallback bila config request_map belum tersedia
+  local pickup = (type(body_data.pickup) == "table") and body_data.pickup or {}
+  local slot   = (type(body_data.pickup_slot) == "table") and body_data.pickup_slot or {}
+
+  local start = tonumber(slot.start_time)
+      or tonumber(pickup.start_time)
+      or tonumber(body_data.start_time)
+      or tonumber(pickup.pickup_time_id)
+      or tonumber(body_data.pickup_time_id)
+
+  local finish = tonumber(slot.end_time)
+      or tonumber(pickup.end_time)
+      or tonumber(body_data.end_time)
+
+  return start, finish
+end
+
+--- Build the POST body for Shopee Ship Order (POST /api/v2/logistics/ship_order).
+-- Per Shopee documentation:
+--   order_sn: string, required
+--   package_number: string, optional (omitted if empty string)
+--   pickup: { address_id (int64, required), pickup_time_id (string), tracking_number (string) }
+--   dropoff: { branch_id (int64), sender_real_name (string), tracking_number (string), slug (string) }
+--   non_integrated: { tracking_number (string) }
+-- Supports both nested structures and standardized flat/unified fields.
+local function legacy_shopee_ship_order_body(params)
+  local body_data = params.body_data or {}
+  local body = {}
+
+  -- order_sn (required)
+  local order_sn = body_data.order_sn or body_data.order_id or params.order_sn or params.order_id or params.product_id
+  if order_sn and order_sn ~= "" then
+    body.order_sn = tostring(order_sn)
+  end
+
+  -- package_number (optional, omit if empty string as per Shopee doc)
+  local package_number = body_data.package_number or params.package_number
+  if package_number and package_number ~= "" then
+    body.package_number = tostring(package_number)
+  end
+
+  local pickup_obj         = has_table(body_data.pickup) and body_data.pickup or nil
+  local slot_obj           = has_table(body_data.pickup_slot) and body_data.pickup_slot or nil
+  local dropoff_obj        = has_table(body_data.dropoff) and body_data.dropoff or nil
+  local non_integrated_obj = has_table(body_data.non_integrated) and body_data.non_integrated or nil
+  local self_shipment_obj  = has_table(body_data.self_shipment) and body_data.self_shipment or nil
+
+  -- Metode efektif sudah dinormalkan (PICKUP / DROP_OFF / NON_INTEGRATED /
+  -- SELF_SHIPMENT) — tidak lagi menebak dari field yang kebetulan ada.
+  local method = _M.resolve_handover_method(body_data)
+
+  if method == "PICKUP" then
+    local p = {}
+
+    local addr_id = (pickup_obj and pickup_obj.address_id) or body_data.address_id
+    if addr_id ~= nil and addr_id ~= "" then
+      p.address_id = math.floor(tonumber(addr_id) or 0)
+    end
+
+    -- Shopee memakai pickup_time_id (string). time_slot_id adalah nama
+    -- standar untuk ID slot native; start_time hanya fallback.
+    local time_id = (pickup_obj and (pickup_obj.time_slot_id or pickup_obj.pickup_time_id))
+        or body_data.time_slot_id
+        or body_data.pickup_time_id
+        or (pickup_obj and pickup_obj.start_time and tostring(pickup_obj.start_time))
+        or (slot_obj and slot_obj.start_time and tostring(slot_obj.start_time))
+        or (body_data.start_time and tostring(body_data.start_time))
+
+    if time_id ~= nil and time_id ~= "" then
+      p.pickup_time_id = tostring(time_id)
+    end
+
+    local trk = (pickup_obj and pickup_obj.tracking_number) or body_data.tracking_number
+    if trk ~= nil and trk ~= "" then
+      p.tracking_number = tostring(trk)
+    end
+
+    body.pickup = p
+
+  elseif method == "DROP_OFF" then
+    local d = {}
+
+    local branch_id = (dropoff_obj and dropoff_obj.branch_id) or body_data.branch_id
+    if branch_id ~= nil and branch_id ~= "" then
+      d.branch_id = math.floor(tonumber(branch_id) or 0)
+    end
+
+    local sender_real_name = (dropoff_obj and dropoff_obj.sender_real_name) or body_data.sender_real_name
+    if sender_real_name ~= nil and sender_real_name ~= "" then
+      d.sender_real_name = tostring(sender_real_name)
+    end
+
+    local trk = (dropoff_obj and dropoff_obj.tracking_number) or body_data.tracking_number
+    if trk ~= nil and trk ~= "" then
+      d.tracking_number = tostring(trk)
+    end
+
+    local slug = (dropoff_obj and dropoff_obj.slug) or body_data.slug
+    if slug ~= nil and slug ~= "" then
+      d.slug = tostring(slug)
+    end
+
+    body.dropoff = d
+
+  elseif method == "NON_INTEGRATED" or method == "SELF_SHIPMENT" then
+    -- Shopee tidak punya objek self_shipment: pengiriman mandiri / kurir
+    -- non-integrasi dikirim lewat `non_integrated.tracking_number`.
+    local ni = {}
+    local trk = (non_integrated_obj and non_integrated_obj.tracking_number)
+        or (self_shipment_obj and self_shipment_obj.tracking_number)
+        or body_data.tracking_number
+    if trk ~= nil and trk ~= "" then
+      ni.tracking_number = tostring(trk)
+    end
+    body.non_integrated = ni
+  end
+
+  -- Passthrough permitted fields from update-config.json,
+  -- but exclude standardized/flat fields that must NOT leak to Shopee root body.
+  local shopee_excluded_root = {
+    order_sn = true, order_id = true, package_id = true, package_number = true,
+    pickup = true, dropoff = true, non_integrated = true,
+    handover_method = true, address_id = true, pickup_time_id = true,
+    tracking_number = true, branch_id = true, sender_real_name = true,
+    slug = true, start_time = true, end_time = true, pickup_slot = true,
+    self_shipment = true, shipping_provider_id = true, time_slot_id = true,
+  }
+  local passthrough = update_config.get_updatable_fields("ship_order", "shopee", body_data)
+  for k, v in pairs(passthrough) do
+    if body[k] == nil and not shopee_excluded_root[k] then
+      body[k] = v
+    end
+  end
+
+  return cjson.encode(body)
+end
+
+--- Build the POST body for TikTok Ship Package (POST /fulfillment/202309/packages/{package_id}/ship).
+-- Per TikTok documentation:
+--   handover_method: "PICKUP" or "DROP_OFF" (string, optional)
+--   pickup_slot: { start_time (int), end_time (int) } (object, optional)
+--   self_shipment: { tracking_number (string), shipping_provider_id (string) } (object, optional)
+-- Note: package_id is passed in the URL path.
+-- Supports standardized request body: translates pickup/address/time into TikTok format.
+local function legacy_tiktok_ship_order_body(params)
+  local body_data = params.body_data or {}
+  local body = {}
+
+  local self_shipment_obj  = has_table(body_data.self_shipment) and body_data.self_shipment or nil
+  local non_integrated_obj = has_table(body_data.non_integrated) and body_data.non_integrated or nil
+
+  local method = _M.resolve_handover_method(body_data)
+
+  -- Durasi slot pickup default bisa diubah dari update-config.json:
+  --   endpoints.ship_order.tiktok.options.default_pickup_duration_seconds
+  local options = update_config.get_options("ship_order", "tiktok")
+  local default_duration = math.floor(tonumber(options.default_pickup_duration_seconds) or 7200)
+  if default_duration <= 0 then
+    default_duration = 7200
+  end
+
+  if method == "PICKUP" then
+    body.handover_method = "PICKUP"
+
+    local st, et = _M.resolve_pickup_times(body_data)
+
+    if st ~= nil then
+      local ps = {}
+      ps.start_time = math.floor(st)
+      ps.end_time = (et ~= nil) and math.floor(et) or (ps.start_time + default_duration)
+      body.pickup_slot = ps
+    elseif et ~= nil then
+      local ps = {}
+      ps.end_time = math.floor(et)
+      ps.start_time = math.max(0, ps.end_time - default_duration)
+      body.pickup_slot = ps
+    end
+
+  elseif method == "DROP_OFF" then
+    body.handover_method = "DROP_OFF"
+
+  elseif method == "SELF_SHIPMENT" or method == "NON_INTEGRATED" then
+    -- TikTok memakai `self_shipment` (tanpa handover_method) untuk
+    -- pengiriman mandiri / non-integrasi.
+    local ss = {}
+    local trk = (self_shipment_obj and self_shipment_obj.tracking_number)
+        or (non_integrated_obj and non_integrated_obj.tracking_number)
+        or body_data.tracking_number
+    local provider = (self_shipment_obj and self_shipment_obj.shipping_provider_id)
+        or body_data.shipping_provider_id
+
+    if trk ~= nil and trk ~= "" then
+      ss.tracking_number = tostring(trk)
+    end
+    if provider ~= nil and provider ~= "" then
+      ss.shipping_provider_id = tostring(provider)
+    end
+    body.self_shipment = ss
+  end
+
+  -- Passthrough permitted fields from update-config.json,
+  -- but exclude standardized/flat fields that must NOT leak to TikTok root body.
+  local tiktok_excluded_root = {
+    order_sn = true, order_id = true, package_id = true, package_number = true,
+    pickup = true, dropoff = true, non_integrated = true,
+    handover_method = true, address_id = true, pickup_time_id = true,
+    tracking_number = true, branch_id = true, sender_real_name = true,
+    slug = true, start_time = true, end_time = true, pickup_slot = true,
+    self_shipment = true, shipping_provider_id = true, time_slot_id = true,
+  }
+  local passthrough = update_config.get_updatable_fields("ship_order", "tiktok", body_data)
+  for k, v in pairs(passthrough) do
+    if body[k] == nil and not tiktok_excluded_root[k] then
+      body[k] = v
+    end
+  end
+
+  return cjson.encode(body)
+end
+
+-- ── Config-Driven Ship Order Body Builder ─────────────────────────────────
+-- Mesin generik: membaca rule dari `request_map` di update-config.json.
+-- Tidak ada nama variabel native yang di-hardcode di sini — ubah JSON untuk
+-- menambah/mengganti field, tipe, nilai literal, atau nilai turunan.
+
+--- Coerce nilai sesuai `type` pada rule JSON.
+local function coerce_value(value, rule)
+  local value_type = rule.type
+
+  if value_type == "integer" then
+    local n = tonumber(value)
+    if not n then
+      return nil
+    end
+    return math.floor(n)
+
+  elseif value_type == "number" then
+    return tonumber(value)
+
+  elseif value_type == "string" then
+    return tostring(value)
+
+  elseif value_type == "boolean" then
+    if value == true or value == "true" then
+      return true
+    end
+    if value == false or value == "false" then
+      return false
+    end
+    return nil
+  end
+
+  return value
+end
+
+--- Terapkan daftar rule field ke body native.
+local function apply_field_rules(body, body_data, rules, options, params)
+  if type(rules) ~= "table" then
+    return
+  end
+
+  for _, rule in ipairs(rules) do
+    local target = rule.target
+
+    if type(target) == "string" and target ~= "" then
+      local value = resolve_rule_value(body_data, rule, params)
+      local output = nil
+
+      if value ~= nil then
+        output = coerce_value(value, rule)
+      end
+
+      -- Nilai turunan, mis. pickup_slot.end_time = start_time + durasi.
+      if output == nil and type(rule.default) == "table" then
+        local default_rule = rule.default
+        local base = get_path(body, default_rule.from)
+            or get_path(body_data, default_rule.from)
+        base = tonumber(base)
+
+        local amount = tonumber(options[default_rule.option])
+            or tonumber(default_rule.value)
+
+        if base ~= nil and amount ~= nil then
+          if default_rule.op == "subtract" then
+            output = math.max(0, math.floor(base - amount))
+          else
+            output = math.floor(base + amount)
+          end
+        end
+      end
+
+      -- String kosong tidak dikirim (mis. package_number split order).
+      if output ~= nil and output ~= "" then
+        set_path(body, target, output)
+      end
+    end
+  end
+end
+
+--- Build body ship_order dari update-config.json.
+-- @param params - Unified params (body_data + path/query params)
+-- @param marketplace - "shopee" atau "tiktok"
+-- @return string - JSON body native
+local function build_ship_order_body(params, marketplace)
+  local body_data = params.body_data or {}
+
+  local endpoint_cfg = get_ship_order_endpoint_config()
+  local mp_cfg = endpoint_cfg[marketplace]
+  local request_map = type(mp_cfg) == "table" and mp_cfg.request_map or nil
+
+  -- Fallback ke builder lama bila config JSON belum tersedia.
+  if type(request_map) ~= "table" then
+    if marketplace == "shopee" then
+      return legacy_shopee_ship_order_body(params)
+    elseif marketplace == "tiktok" then
+      return legacy_tiktok_ship_order_body(params)
+    end
+    return "{}"
+  end
+
+  local options = type(mp_cfg.options) == "table" and mp_cfg.options or {}
+  local body = {}
+
+  -- 1) Field root (mis. order_sn, package_number)
+  apply_field_rules(body, body_data, request_map.root_fields, options, params)
+
+  -- 2) Field spesifik metode handover
+  local method = _M.resolve_handover_method(body_data, marketplace)
+  local methods = type(request_map.methods) == "table" and request_map.methods or {}
+  local method_cfg = method and methods[method] or nil
+  if type(method_cfg) == "table" then
+    apply_field_rules(body, body_data, method_cfg.fields, options, params)
+  end
+
+  -- 3) Passthrough whitelist (updatable_fields), kecuali field terlarang
+  local excluded = {}
+  if type(request_map.excluded_root_fields) == "table" then
+    for _, field in ipairs(request_map.excluded_root_fields) do
+      excluded[field] = true
+    end
+  end
+
+  local passthrough = update_config.get_updatable_fields("ship_order", marketplace, body_data)
+  for key, value in pairs(passthrough) do
+    if body[key] == nil and not excluded[key] then
+      body[key] = value
+    end
+  end
+
+  local ok, json = pcall(cjson.encode, body)
+  if ok and json then
+    return json
+  end
+  return "{}"
+end
+
+--- Wrapper agar registry body builder tidak berubah.
+local function shopee_ship_order_body(params)
+  return build_ship_order_body(params, "shopee")
+end
+
+local function tiktok_ship_order_body(params)
+  return build_ship_order_body(params, "tiktok")
+end
+
+-- ── Unified → Lazada Parameter Transform ────────────────────────────────
+
+--- Convert a Unix timestamp (seconds) to ISO 8601 UTC.
+-- Lazada order/product filters use ISO 8601 dates, e.g. 2026-10-20T12:00:00Z.
+-- @param ts - Unix timestamp (seconds)
+-- @return string - ISO 8601 UTC timestamp
+local function to_iso8601(ts)
+  return os.date("!%Y-%m-%dT%H:%M:%SZ", tonumber(ts) or ngx.time())
+end
+
+--- Transform unified product listing params to Lazada-specific params.
+-- Lazada GetProducts (GET /products/get):
+--   filter           → all | live | inactive | deleted | pending | rejected | sold-out
+--   limit            → 1..50
+--   offset           → (page - 1) * limit
+--   options          → 1 = sertakan ReservedStock / RtsStock / dll
+--   sku_seller_list  → JSON array of SellerSku (optional)
+--
+-- @param params - Unified parameters: { page, page_size, status, sku_list }
+-- @param credentials - Combined credentials table
+-- @return table - Lazada query parameters
+local function lazada_product_list(params, credentials)
+  local limit = math.floor(tonumber(params.page_size) or 50)
+  if limit < 1 then limit = 1 end
+  if limit > 50 then limit = 50 end
+
+  local page = math.floor(tonumber(params.page) or 1)
+  if page < 1 then page = 1 end
+
+  -- Internal status → Lazada native status via content-mapping.json
+  local filter = "live"
+  if params.status and params.status ~= "" then
+    local native = status_mapper.to_native("lazada", tostring(params.status):upper())
+    filter = native or tostring(params.status):lower()
+  end
+
+  local q = {
+    filter   = filter,
+    limit    = limit,
+    offset   = (page - 1) * limit,
+    options  = 1,
+  }
+
+  -- Optional: restrict to a list of SellerSku (max 100 per Lazada docs)
+  local sku_list = params.sku_list or params.sku_seller_list
+  if type(sku_list) == "table" and #sku_list > 0 then
+    local ok, encoded = pcall(cjson.encode, sku_list)
+    if ok and encoded then
+      q.sku_seller_list = encoded
+    end
+  elseif type(sku_list) == "string" and sku_list ~= "" then
+    q.sku_seller_list = sku_list
+  end
+
+  return q
+end
+
+--- Transform unified product detail params to Lazada-specific params.
+-- Lazada GetProductItem (GET /product/item/get): item_id (Number).
+-- @param params - Unified parameters: { product_id }
+-- @param credentials - Combined credentials table
+-- @return table - Lazada query parameters
+local function lazada_product_detail(params, credentials)
+  local product_id = params and params.product_id
+  if product_id == nil or product_id == "" then
+    return {}
+  end
+  return { item_id = tonumber(product_id) or product_id }
+end
+
+--- Transform unified order list params to Lazada-specific params.
+-- Lazada GetOrders (GET /orders/get):
+--   limit (max 100), offset, sort_by, sort_direction,
+--   update_after/update_before atau created_after/created_before (ISO 8601),
+--   status (unpaid | pending | canceled | ready_to_ship | delivered |
+--           returned | shipped | failed | topack | toship | shipping | lost)
+--
+-- Minimal SATU dari update_after / created_after wajib dikirim. Default:
+-- 30 hari terakhir berdasarkan update_after.
+--
+-- @param params - Unified parameters: { page, page_size, status,
+--                                       create_time_ge/lt, update_time_ge/lt }
+-- @param credentials - Combined credentials table
+-- @return table - Lazada query parameters
+local function lazada_order_list(params, credentials)
+  local limit = math.floor(tonumber(params.page_size) or 20)
+  if limit < 1 then limit = 1 end
+  if limit > 100 then limit = 100 end
+
+  local page = math.floor(tonumber(params.page) or 1)
+  if page < 1 then page = 1 end
+
+  local q = {
+    limit          = limit,
+    offset         = (page - 1) * limit,
+    sort_by        = params.sort_field or "updated_at",
+    sort_direction = tostring(params.sort_order or "DESC"):upper(),
+  }
+
+  local now = ngx.time()
+  local update_ge = tonumber(params.update_time_ge)
+  local update_lt = tonumber(params.update_time_lt)
+  local create_ge = tonumber(params.create_time_ge)
+  local create_lt = tonumber(params.create_time_lt)
+
+  if update_ge or update_lt then
+    q.update_after  = to_iso8601(update_ge or (now - 30 * 86400))
+    if update_lt then q.update_before = to_iso8601(update_lt) end
+  elseif create_ge or create_lt then
+    q.created_after = to_iso8601(create_ge or (now - 30 * 86400))
+    if create_lt then q.created_before = to_iso8601(create_lt) end
+  else
+    q.update_after  = to_iso8601(now - 30 * 86400)
+    q.update_before = to_iso8601(now)
+  end
+
+  -- Lazada memakai status native huruf kecil (unpaid, ready_to_ship, ...)
+  if params.status and params.status ~= "" then
+    q.status = tostring(params.status):lower()
+  end
+
+  return q
+end
+
+--- Transform unified order detail params to Lazada-specific params.
+-- Lazada GetOrderItems (GET /order/items/get): order_id (satu per call).
+-- request-transformer meloop untuk beberapa order ID lalu menggabungkan hasil.
+-- @param params - Unified parameters: { order_ids = "id1,id2" }
+-- @param credentials - Combined credentials table
+-- @return table - Lazada query parameters
+local function lazada_order_detail(params, credentials)
+  local ids = params.order_ids
+  if not ids or ids == "" then
+    return {}
+  end
+  local first = tostring(ids):match("^([^,]+)") or tostring(ids)
+  return { order_id = tonumber(first) or first }
+end
+
+--- Build the JSON body for Lazada EditChoiceSkuStock (POST /choice/stock/edit).
+--
+-- Unified body:
+--   { "skus": [{ "id": "<sku_id>", "stock": 10 }], "site": "SG" }
+-- Legacy/native inventory array juga didukung (quantity diambil dari entry
+-- pertama — API Lazada ini TIDAK mendukung multi-warehouse).
+--
+-- Lazada body:
+--   { "item_id": 123, "site": "SG", "sku_edit_stock": { "<sku_id>": 10 } }
+--
+-- @param params - Unified parameters including body_data + product_id + site
+-- @return string - JSON-encoded request body
+local function lazada_update_stock_body(params)
+  local body_data = params.body_data or {}
+  local skus = body_data.skus or {}
+
+  local sku_edit_stock = {}
+  for _, sku in ipairs(skus) do
+    local sku_id = tostring(sku.id or "")
+    if sku_id ~= "" then
+      local qty
+      if type(sku.inventory) == "table" and #sku.inventory > 0 then
+        local inv = sku.inventory[1]
+        qty = tonumber(inv.quantity or inv.stock)
+      else
+        qty = tonumber(sku.stock)
+      end
+      if qty == nil then qty = 0 end
+      if qty < 0 then qty = 0 end
+      sku_edit_stock[sku_id] = qty
+    end
+  end
+
+  local site = body_data.site or params.site or ""
+
+  local body = {
+    item_id        = tonumber(params.product_id) or params.product_id,
+    site           = tostring(site):upper(),
+    sku_edit_stock = sku_edit_stock,
+  }
+
+  local ok, json = pcall(cjson.encode, body)
+  if ok and json then
+    return json
+  end
+  return "{}"
+end
+
 -- ── Parameter Transform Registry ──────────────────────────────────────────
 -- Each endpoint + marketplace combination has a transform function.
 
+--- Transform untuk get_shipping_parameter (Shopee).
+-- Semua parameter bisnis (order_sn) dikirim di BODY; di query cukup shop_id
+-- (partner_id/timestamp/sign/access_token ditambahkan adapter).
+local function shopee_shipping_parameter(params, credentials)
+  return { shop_id = credentials.shop_id }
+end
+
+--- Body untuk get_shipping_parameter (Shopee): { "order_sn": "..." }.
+local function shopee_shipping_parameter_body(params)
+  local body_data = type(params.body_data) == "table" and params.body_data or {}
+  local order_sn = body_data.order_sn or params.order_sn or params.order_id
+  if order_sn == nil or order_sn == "" then
+    return "{}"
+  end
+
+  local ok, json = pcall(cjson.encode, { order_sn = tostring(order_sn) })
+  if ok and json then
+    return json
+  end
+  return "{}"
+end
+
 local TRANSFORM_REGISTRY = {
+  -- ── Shopee get_shipping_parameter (scanning alamat + slot pickup) ─────
+  shipping_parameter = {
+    shopee = shopee_shipping_parameter,
+  },
   products = {
     shopee = shopee_product_list,
     tiktok = tiktok_product_list,
+    lazada = lazada_product_list,
   },
   product_detail = {
     shopee = shopee_product_detail,
     tiktok = tiktok_product_detail,
+    lazada = lazada_product_detail,
   },
   model_list = {
     shopee = function(params, credentials)
@@ -1123,6 +1975,8 @@ local TRANSFORM_REGISTRY = {
       return { shop_id = credentials.shop_id }
     end,
     tiktok = function() return {} end,
+    -- Lazada: parameter bisnis dikirim sebagai JSON body (tidak di query)
+    lazada = function() return {} end,
   },
   create_product = {
     shopee = function(params, credentials)
@@ -1146,10 +2000,18 @@ local TRANSFORM_REGISTRY = {
   orders = {
     shopee = shopee_order_list,
     tiktok = tiktok_order_list,
+    lazada = lazada_order_list,
   },
   order_detail = {
     shopee = shopee_order_detail,
     tiktok = tiktok_order_detail,
+    lazada = lazada_order_detail,
+  },
+  ship_order = {
+    shopee = function(params, credentials)
+      return { shop_id = credentials.shop_id }
+    end,
+    tiktok = function() return {} end,
   },
 }
 
@@ -1157,6 +2019,10 @@ local TRANSFORM_REGISTRY = {
 -- For POST endpoints, return a function that builds the JSON body.
 
 local BODY_REGISTRY = {
+  -- ── Shopee get_shipping_parameter (scanning alamat + slot pickup) ─────
+  shipping_parameter = {
+    shopee = shopee_shipping_parameter_body,
+  },
   products = {
     tiktok = tiktok_products_body,
   },
@@ -1166,6 +2032,7 @@ local BODY_REGISTRY = {
   update_stock = {
     shopee = shopee_update_stock_body,
     tiktok = tiktok_update_stock_body,
+    lazada = lazada_update_stock_body,
   },
   create_product = {
     shopee = shopee_create_product_body,
@@ -1184,6 +2051,10 @@ local BODY_REGISTRY = {
   },
   orders = {
     tiktok = tiktok_order_list_body,
+  },
+  ship_order = {
+    shopee = shopee_ship_order_body,
+    tiktok = tiktok_ship_order_body,
   },
 }
 

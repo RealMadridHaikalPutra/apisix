@@ -19,13 +19,17 @@
    - [5.2 Endpoint Webhook](#52-endpoint-webhook)
    - [5.3 Shopee Webhook](#53-shopee-webhook)
    - [5.4 TikTok Webhook](#54-tiktok-webhook)
-   - [5.5 Data Storage](#55-data-storage)
-   - [5.6 Simulasi Webhook](#56-simulasi-webhook)
+   - [5.4a Lazada Webhook (Push Mechanism)](#54a-lazada-webhook-push-mechanism)
+   - [5.5 Webhook Forwarding (Configurable)](#55-webhook-forwarding-configurable)
+   - [5.6 FIFO, Dedup, Rate Limit & Outbox (antrean webhook)](#56-fifo-dedup-rate-limit--outbox-antrean-webhook)
+   - [5.7 Data Storage](#57-data-storage)
+   - [5.8 Simulasi Webhook](#58-simulasi-webhook)
 6. [Product Endpoints](#6-product-endpoints)
    - [6.1 GET /products — Daftar Produk](#61-get-products--daftar-produk)
    - [6.2 GET /products/{id} — Detail Produk](#62-get-productsid--detail-produk)
    - [6.3 Inventory Search via /products (TikTok Only)](#63-inventory-search-via-products-tiktok-only)
-   - [6.4 GET /order — Order List & Detail (Shopee & TikTok)](#64-get-order--order-list--detail-shopee--tiktok)
+   - [6.4 GET /order — Order List & Detail (Shopee, TikTok & Lazada)](#64-get-order--order-list--detail-shopee-tiktok--lazada)
+   - [6.5 POST /ship-order — Ship Order & Ship Package (Shopee & TikTok)](#65-post-ship-order--ship-order--ship-package-shopee--tiktok)
 7. [Unified Response Schema](#7-unified-response-schema)
    - [7.1 Schema Produk (Unified)](#71-schema-produk-unified)
    - [7.1a Unified `location_id` Field (Response)](#71a-unified-location_id-field-response)
@@ -47,14 +51,22 @@
    - [11.1 Perbedaan Shopee vs TikTok](#111-perbedaan-shopee-vs-tiktok)
    - [11.2 Tips & Troubleshooting](#112-tips--troubleshooting)
    - [11.3 Riwayat Perbaikan](#113-riwayat-perbaikan)
+12. [Lazada Integration](#12-lazada-integration)
+   - [12.1 Ringkasan Endpoint Lazada](#121-ringkasan-endpoint-lazada)
+   - [12.2 Signature & Timestamp Lazada](#122-signature--timestamp-lazada)
+   - [12.3 Update Stock Lazada (EditChoiceSkuStock)](#123-update-stock-lazada-editchoiceskustock)
+   - [12.4 Orders Lazada](#124-orders-lazada)
+   - [12.5 Konfigurasi (Configurable)](<#125-konfigurasi-configurable>)
+   - [12.6 Webhook Lazada (Push Mechanism)](#126-webhook-lazada-push-mechanism)
+   - [12.7 Keterbatasan](#127-keterbatasan)
 
 ---
 
 ## 1. Pendahuluan
 
-**Unified Marketplace Gateway** adalah middleware berbasis Apache APISIX yang menyediakan satu API terpadu untuk mengakses berbagai marketplace (Shopee dan TikTok). Gateway ini menangani seluruh kompleksitas di balik layar:
+**Unified Marketplace Gateway** adalah middleware berbasis Apache APISIX yang menyediakan satu API terpadu untuk mengakses berbagai marketplace (Shopee, TikTok, dan Lazada). Gateway ini menangani seluruh kompleksitas di balik layar:
 
-- **Autentikasi & Signatures** — HMAC-SHA256 signed requests untuk Shopee dan TikTok
+- **Autentikasi & Signatures** — HMAC-SHA256 signed requests untuk Shopee, TikTok, dan Lazada
 - **Token Lifecycle** — Auto-refresh access token yang expired
 - **Parameter Mapping** — Konversi parameter unified ke format spesifik marketplace
 - **Response Normalization** — Normalisasi response dari berbagai marketplace ke satu format
@@ -68,7 +80,7 @@
 ### Prerequisites
 
 - Docker & Docker Compose
-- Kredensial API marketplace (Shopee Partner ID/Key, TikTok App Key/Secret)
+- Kredensial API marketplace (Shopee Partner ID/Key, TikTok App Key/Secret, Lazada App Key/Secret)
 - Shop credentials terdaftar di `credentials/credentials.json`
 
 ---
@@ -91,6 +103,11 @@ Edit file `credentials/credentials.json`:
       "app_key": "6ff2n93hlp7k5",
       "app_secret": "033e231fad68e1f4d44dedb237a2164cda5129bb",
       "base_url": "https://open-api.tiktokglobalshop.com"
+    },
+    "lazada": {
+      "app_key": "YOUR_LAZADA_APP_KEY",
+      "app_secret": "YOUR_LAZADA_APP_SECRET",
+      "base_url": "https://api.lazada.sg/rest"
     }
   },
   "shops": [
@@ -117,6 +134,19 @@ Edit file `credentials/credentials.json`:
       "access_token_expires_at": null,
       "refresh_token_expires_at": null,
       "status": "active"
+    },
+    {
+      "shop_uuid": "my-lazada-shop",
+      "marketplace": "lazada",
+      "shop_id": null,
+      "shop_cipher": null,
+      "auth_code": null,
+      "access_token": null,
+      "refresh_token": null,
+      "access_token_expires_at": null,
+      "refresh_token_expires_at": null,
+      "region": "sg",
+      "status": "active"
     }
   ]
 }
@@ -130,6 +160,20 @@ Edit file `credentials/credentials.json`:
 > ```
 > https://partner.shopeemobile.com
 > ```
+
+> **⚠️ Lazada — base_url PER REGION:** Lazada memakai host API yang berbeda
+> untuk setiap negara. Set `global.lazada.base_url` sesuai region toko:
+>
+> | Region | Base URL |
+> |--------|----------|
+> | Singapore (default) | `https://api.lazada.sg/rest` |
+> | Malaysia | `https://api.lazada.com.my/rest` |
+> | Thailand | `https://api.lazada.co.th/rest` |
+> | Vietnam | `https://api.lazada.vn/rest` |
+> | Indonesia | `https://api.lazada.co.id/rest` |
+> | Philippines | `https://api.lazada.com.ph/rest` |
+>
+> Auth (token) selalu memakai `https://auth.lazada.com/rest` untuk semua region.
 
 ### 2.2 Start Gateway
 
@@ -158,8 +202,14 @@ curl -X POST http://localhost:9080/auth/refresh \
 | 1  | Shopee            | `partner.shopeemobile.com`           | 443  | Shopee Products + Shopee Auth (sama host)|
 | 2  | TikTok Products   | `open-api.tiktokglobalshop.com`      | 443  | TikTok Product List & Detail             |
 | 3  | TikTok Auth       | `auth.tiktok-shops.com`              | 443  | TikTok Token & Refresh (**host berbeda!**)|
+| 4  | Lazada            | `api.lazada.sg` (default)             | 443  | Lazada Products, Stock, Orders + Auth |
 
 > **Penting:** Shopee menggunakan **host yang sama** untuk Product API dan Auth API. TikTok menggunakan **host yang berbeda** — Product API di `open-api.tiktokglobalshop.com`, Auth API di `auth.tiktok-shops.com`.
+>
+> **Lazada:** host API **per region** (lihat 2.1). Upstream 4 hanyalah
+> placeholder untuk route APISIX — request sebenarnya dibuat oleh
+> `request-transformer` via `resty.http` memakai `global.lazada.base_url`,
+> dan auth memakai `https://auth.lazada.com/rest`.
 
 #### Tabel Routes
 
@@ -172,12 +222,17 @@ curl -X POST http://localhost:9080/auth/refresh \
 | 5        | POST        | `/update-stock*`| `marketplace=tiktok`       | 2 (TikTok)  | credential-loader, marketplace-router, request-transformer |
 | 6        | POST        | `/webhook/shopee`      | —                | 1 (placeholder) | webhook-receiver |
 | 7        | POST        | `/webhook/tiktok`      | —                | 1 (placeholder) | webhook-receiver |
+| 25       | POST        | `/webhook/lazada`      | —                | 4 (placeholder) | webhook-receiver |
 | 8        | GET, POST   | `/webhook/register`   | —                | 1 (placeholder) | webhook-registrar |
 | 10       | POST        | `/auth/*`     | —                             | 1 (placeholder) | token-manager                              |
 | 12       | POST        | `/update-status*` | `marketplace=shopee`    | 1 (Shopee)  | credential-loader, marketplace-router, request-transformer |
 | 13       | POST        | `/update-status*` | `marketplace=tiktok`    | 2 (TikTok)  | credential-loader, marketplace-router, request-transformer |
 | 14       | GET         | `/order*`     | `marketplace=tiktok`          | 2 (TikTok)  | credential-loader, marketplace-router, request-transformer |
 | 15       | GET         | `/order*`     | `marketplace=shopee`          | 1 (Shopee)  | credential-loader, marketplace-router, request-transformer |
+| 21       | GET, POST   | `/products*`  | `marketplace=lazada`          | 4 (Lazada)  | credential-loader, marketplace-router, request-transformer |
+| 22       | POST        | `/update-stock*` | `marketplace=lazada`       | 4 (Lazada)  | credential-loader, marketplace-router, request-transformer |
+| 23       | GET         | `/order*`     | `marketplace=lazada`          | 4 (Lazada)  | credential-loader, marketplace-router, request-transformer |
+| 24       | POST        | `/update-status*` | `marketplace=lazada` (ditolak) | 4 (Lazada) | credential-loader, marketplace-router, request-transformer |
 | 1d       | GET, POST   | `/products*`  | — (fallback tanpa marketplace) | 1 (Shopee)  | credential-loader, marketplace-router, request-transformer |
 | 13b      | POST        | `/update-status*` | `marketplace=all` (ditolak) | 1 (Shopee)  | credential-loader, request-transformer |
 | 13c      | POST        | `/update-stock*` | `marketplace=all` (ditolak) | 1 (Shopee)  | credential-loader, request-transformer |
@@ -201,7 +256,7 @@ Request → credential-loader (rewrite) → marketplace-router (rewrite) → req
 ```
 
 - **credential-loader**: Memuat kredensial shop + auto-refresh token jika expired
-- **marketplace-router**: Menentukan adapter marketplace (shopee/tiktok) berdasarkan parameter
+- **marketplace-router**: Menentukan adapter marketplace (shopee/tiktok/lazada) berdasarkan parameter
 - **request-transformer**: Generate signature HMAC-SHA256, rewrite request, call API langsung via `resty.http`, normalisasi response
 
 ---
@@ -472,6 +527,37 @@ POST http://localhost:9080/update-stock/{product_id}
 
 Gateway menerima **dua format body** sekaligus — pilih yang sesuai dengan struktur data Anda.
 
+##### ⚠️ Produk Tanpa Varian vs Produk Bervarian — WAJIB DIBACA
+
+Kesalahan paling umum pada update-stock adalah salah mengirim `skus[].id`. Aturannya **berbeda per marketplace**:
+
+| Kondisi Produk | Marketplace | Nilai `skus[].id` yang Benar |
+|----------------|-------------|------------------------------|
+| **Tanpa varian** (single item, tidak ada pilihan warna/size) | **Shopee** | `"0"` — Shopee memakai konvensi `model_id = 0` untuk "default model" produk tanpa varian |
+| **Tanpa varian** | **TikTok** | **ID SKU asli dari TikTok** — TikTok SELALU punya minimal 1 SKU per produk. Tidak ada konsep `"0"`; mengirim `"0"` akan ditolak (`12052556: The SKU id not exist`) |
+| **Bervarian** (mis. warna merah/biru) | Shopee | `model_id` varian tersebut (dari `variations[].id` di response `GET /products`) |
+| **Bervarian** | TikTok | `skus[].id` varian tersebut (dari `variations[].id` di response `GET /products`) |
+
+**Cara mendapatkan ID yang benar:** panggil `GET /products/{product_id}` (atau `GET /products`) dan ambil dari field `variations[].id` pada response unified:
+
+```json
+{
+  "marketplace": "shopee",
+  "products": [{
+    "id": "802023254",
+    "variations": [
+      { "id": "19560950944", "name": "Merah", "sku": "AB-RED", "stock": 10 }
+    ]
+  }]
+}
+```
+
+- Produk Shopee **tanpa varian** → `variations` biasanya kosong, gunakan `"id": "0"`.
+- Produk TikTok **tanpa varian** → `variations` tetap berisi **1 SKU** (TikTok membuat SKU default otomatis); gunakan ID SKU tersebut, **BUKAN** `"0"`.
+- Jika `skus[].id` tidak terdaftar pada produk tersebut, marketplace akan menolak per-item. Dengan strict error handling gateway, kegagalan ini kini dibalas sebagai **HTTP 400 `PARTIAL_FAILURE`** (bukan 200) — lihat [Error Responses](#error-responses-1).
+
+> **Ringkasan:** `"0"` HANYA untuk Shopee tanpa varian. Untuk TikTok, selalu pakai SKU ID asli — apa pun bentuk produknya.
+
 ##### Format A — Native (Direkomendasikan)
 
 Mendukung **multi-warehouse** per SKU, `backorder_quantity`, dan `handling_time`. Ini adalah pemetaan langsung ke endpoint TikTok [`/product/202309/products/{product_id}/inventory/update`](https://partner.tiktokshop.com/docv2).
@@ -546,6 +632,15 @@ Single warehouse per SKU. Tetap didukung untuk backward compatibility dan secara
 | `skus[].inventory[].warehouse_id` (Format A)| `stock_list[].seller_stock[].location_id`| `skus[].inventory[].warehouse_id`        |
 | `skus[].stock` (Format B)              | `stock_list[].seller_stock[].stock`           | `skus[].inventory[].quantity`            |
 | `skus[].warehouse_id` (Format B)       | `stock_list[].seller_stock[].location_id`     | `skus[].inventory[].warehouse_id`        |
+
+**Lazada** memakai bentuk yang berbeda (`POST /choice/stock/edit`):
+
+| Unified Field                    | Lazada Field                                         |
+|----------------------------------|-------------------------------------------------------|
+| `product_id` (path)              | `item_id` (body, Number)                              |
+| `skus[].id`                      | key `sku_edit_stock` (SkuId)                          |
+| `skus[].inventory[].quantity` / `skus[].stock` | value `sku_edit_stock[sku_id]`           |
+| `site` (body/query)              | `site` — **wajib** (`SG`/`MY`/`ID`/`PH`/`TH`/`VN`)     |
 
 #### Validasi Gateway
 
@@ -630,11 +725,13 @@ curl -X POST "http://localhost:9080/update-stock/802023254?marketplace=shopee&sh
 
 #### Success Response (200 OK)
 
-Response adalah **RAW dari marketplace** yang dibungkus dengan informasi marketplace:
+Response adalah **RAW dari marketplace** yang dibungkus dengan informasi marketplace. Response 200 **dijamin bersih**: semua kegagalan per-item (`failure_list`, error flag, `code != 0`) sudah difilter dan dibalas sebagai HTTP error.
 
 ```json
 {
   "marketplace": "shopee",
+  "action": "update_stock",
+  "success": true,
   "raw_response": {
     "error": "",
     "message": "",
@@ -685,6 +782,54 @@ Response adalah **RAW dari marketplace** yang dibungkus dengan informasi marketp
 }
 ```
 
+**400 Bad Request — PARTIAL_FAILURE (error per-item dari marketplace, STRICT)** ⚠️
+
+Shopee membalas HTTP 200 walaupun update per-item GAGAL (mis. model ID salah). Gateway **tidak pernah** meneruskan kegagalan tersebut sebagai 200 — jika ada minimal SATU item gagal, seluruh request dibalas HTTP 400:
+
+```json
+{
+  "error": {
+    "code": "PARTIAL_FAILURE",
+    "message": "marketplace rejected 1 item(s) — failure_list: 19560950944: model ID not exist in sku",
+    "marketplace": "shopee",
+    "original_status": 400,
+    "original_code": "PARTIAL_FAILURE",
+    "request_id": "req_abc123",
+    "failures": [
+      {
+        "model_id": 19560950944,
+        "failed_reason": "model ID not exist in sku"
+      }
+    ],
+    "success_count": 0
+  }
+}
+```
+
+Penyebab umum:
+- `skus[].id` = `"0"` dikirim ke **TikTok** (TikTok tidak punya konsep model 0 — pakai SKU ID asli)
+- `skus[].id` = ID model dari produk/shop yang salah
+- Produk sudah dihapus/diarsipkan di marketplace
+
+**Error marketplace lain (HTTP 4xx/5xx dari upstream, STRICT)**
+
+HTTP error dari marketplace juga **tidak pernah** dibungkus 200. Gateway memetakan ke unified error dengan `original_code` dan pesan asli dari marketplace:
+
+```json
+{
+  "error": {
+    "code": "UPSTREAM_ERROR",
+    "message": "<pesan error asli dari marketplace>",
+    "marketplace": "shopee",
+    "original_status": 502,
+    "original_code": "400",
+    "request_id": "req_abc123"
+  }
+}
+```
+
+> **Aturan strict error handling:** TIDAK ADA error yang lolos sebagai HTTP 200. Berlaku untuk semua endpoint mutasi (update-stock, update-status, create-product) sekaligus endpoint baca (product detail, inventory search): transport error, HTTP 4xx/5xx upstream, business error di HTTP 200 (Shopee `failure_list` / error flag, TikTok `code != 0`), body kosong, dan body non-JSON semuanya dibalas sebagai HTTP error yang benar (400/401/429/502 sesuai penyebabnya).
+
 #### Marketplace Spesifik
 
 **Shopee:**
@@ -693,7 +838,7 @@ Response adalah **RAW dari marketplace** yang dibungkus dengan informasi marketp
 - `model_id` = 0 untuk produk tanpa variasi, atau ID model untuk produk dengan variasi
 - `location_id` optional — jika tidak ada warehouse, kirim string kosong
 - Multi-warehouse SKU (Format A): satu entry di `inventory[]` per warehouse, menghasilkan beberapa entry di `stock_list[].seller_stock[]`
-- Response: `response.success_list` dan `response.failure_list`
+- Response: `response.success_list` dan `response.failure_list` — **jika `failure_list` tidak kosong, gateway membalas 400 `PARTIAL_FAILURE`** (lihat Error Responses di atas)
 
 **TikTok:**
 - Endpoint: `POST /product/202309/products/{product_id}/inventory/update`
@@ -702,7 +847,8 @@ Response adalah **RAW dari marketplace** yang dibungkus dengan informasi marketp
 - Valid range `quantity`: **1–99,999** (out-of-range akan di-clamp oleh gateway)
 - `backorder_quantity`: auto-convert ke `quantity` setelah stok habis (valid range: 0–99,999)
 - `handling_time`: harus sama untuk semua warehouse entry pada SKU yang sama
-- Response: `code: 0` menandakan sukses, dengan `data.errors` untuk partial failures (lihat [Update Inventory Error Codes](#update-inventory-error-codes))
+- Response: `code: 0` menandakan sukses; `code != 0` (termasuk `12052556: The SKU id not exist` untuk `skus[].id` yang salah) dibalas gateway sebagai HTTP error — lihat [Update Inventory Error Codes](#update-inventory-error-codes)
+- ⚠️ **TikTok tidak punya konsep `model_id = 0`** — setiap produk (termasuk tanpa varian) memiliki minimal 1 SKU ID asli yang wajib dipakai di `skus[].id`
 
 #### Update Inventory Error Codes
 
@@ -1043,9 +1189,10 @@ Response adalah **RAW dari marketplace** yang dibungkus dengan informasi status:
 
 ### 5.1 Overview
 
-Gateway menerima webhook **real-time stock update** dari Shopee dan TikTok.
-Setiap kali stok berubah di marketplace (setelah checkout/pembayaran), marketplace
-mengirim notifikasi ke gateway yang otomatis menyimpan payload ke file JSON.
+Gateway menerima webhook **real-time** dari Shopee, TikTok, dan Lazada. Setiap
+kali stok / status order berubah di marketplace, marketplace mengirim notifikasi
+ke gateway yang otomatis menyimpan payload ke file JSON lalu (opsional)
+meneruskannya ke backend — lihat §5.5.
 
 ### 5.2 Endpoint Webhook
 
@@ -1053,6 +1200,7 @@ mengirim notifikasi ke gateway yang otomatis menyimpan payload ke file JSON.
 |--------|------------------------|-------------|----------------------------------------------|
 | POST   | `/webhook/shopee`      | Shopee      | Menerima SEMUA event webhook dari Shopee     |
 | POST   | `/webhook/tiktok`      | TikTok      | Menerima SEMUA event webhook dari TikTok     |
+| POST   | `/webhook/lazada`      | Lazada      | Menerima SEMUA push dari Lazada Push Mechanism |
 
 ### 5.3 Shopee Webhook
 
@@ -1196,7 +1344,389 @@ HMAC-SHA256(AppSecret, RawBody + Timestamp)
 }
 ```
 
-### 5.5 Data Storage
+### 5.4a Lazada Webhook (Push Mechanism)
+
+Endpoint `/webhook/lazada` menerima **semua push** dari Lazada Push Mechanism.
+Berbeda dengan Shopee/TikTok yang memakai `code`/`type`, Lazada memakai field
+`message_type`. Satu endpoint menangani semua message type.
+
+#### Konfigurasi
+
+Di **Lazada Open Platform → App Console → Push Mechanism**:
+
+1. Isi callback URL — Lazada **mewajibkan HTTPS** dengan sertifikat CA level
+   OV/EV (DV & self-signed ditolak):
+   ```
+   https://your-server/webhook/lazada
+   ```
+   (TLS biasanya di-terminate reverse proxy di depan APISIX, lalu diteruskan ke
+   port 9080.)
+2. Klik **Verify** — Lazada mengirim test message; gateway membalas HTTP 200.
+3. Pilih message type yang ingin disubscribe, lalu **Save**.
+
+Satu AppKey hanya boleh punya satu callback URL. Pengiriman bersifat
+**at-least-once**: bila tidak ada HTTP 200 dalam **500ms**, Lazada retry tiap
+**30 menit** sampai **12x**. Gateway membalas segera setelah payload disimpan +
+forward dijadwalkan (bukan diproses sinkron), dan body duplikat dibuang oleh
+dedup (§5.6).
+
+#### Keamanan
+
+Lazada mengirim signature di header `Authorization` (hex lowercase):
+
+```
+HEX_ENCODE(HMAC-SHA256(AppSecret, AppKey + RawBody))
+```
+
+`RawBody` harus **byte-identik** dengan yang dikirim Lazada (gateway memakai
+`ngx.req.get_body_data()` sebelum parsing). Gateway memakai
+`global.lazada.app_key` + `global.lazada.app_secret`. Konsisten dengan
+Shopee/TikTok, signature tidak valid → **log warning + tetap diproses** agar
+webhook tidak hilang saat kredensial belum benar.
+
+#### Message Type
+
+| `message_type` | `event_type` di gateway | Isi utama |
+|----------------|-------------------------|-----------|
+| `0` | `order_update` | `data.order_status`, `data.trade_order_id`, `data.trade_order_line_id`, `data.status_update_time` |
+| `0` + `data.reverse_order_id` | `reverse_order_update` | return/refund: `reverse_order_id`, `reverse_order_line_id`, `trade_order_id` asal |
+| `3` | `product_created` | `data.item_id`, `data.sku_list[]`, `data.action` (`PUBLISHED`/`EDITED_INSERTED`) |
+| `4` | `product_updated` | `data.item_id`, `data.sku_list[]`, `data.action` (`EDITED_UPDATED`) |
+| `5` | `product_deleted` | `data.item_id`, `data.sku_list[]`, `data.action` (`DELETED`/`EDITED_DELETED`) |
+| lainnya | `event_<message_type>` | diteruskan apa adanya |
+
+Semua event disimpan untuk auditing (§5.7) dan di-forward (§5.5). Signal code
+yang dipakai filter `signal_codes` = **`message_type`** (lihat
+`settings.signal_code_paths.lazada`).
+
+#### Payload (message_type = 0 — Trade Order)
+
+```json
+{
+  "seller_id": "1234567",
+  "message_type": 0,
+  "data": {
+    "order_status": "unpaid",
+    "trade_order_id": "260422900198363",
+    "trade_order_line_id": "260422900298363",
+    "status_update_time": 1603698638
+  },
+  "timestamp": 1603766859530,
+  "site": "lazada_vn"
+}
+```
+
+| Field | Tipe | Deskripsi |
+|-------|------|-----------|
+| `seller_id` | string | ID seller Lazada (pengganti `shop_id` milik Shopee/TikTok) |
+| `message_type` | number | `0` = order, `3`/`4`/`5` = product |
+| `data.order_status` | string | Status ASC Lazada (`unpaid`, `pending`, `ready_to_ship`, `shipped`, `delivered`, `canceled`, `returned`, …) |
+| `data.trade_order_id` | string | Order ID — sama dengan `order_id` di API `GET /order?ids=` |
+| `data.trade_order_line_id` | string | Sub-order (line) ID |
+| `data.status_update_time` | number | Unix timestamp perubahan status (detik) |
+| `timestamp` | number | Unix timestamp push (milidetik) |
+| `site` | string | Site Lazada (`lazada_sg`, `lazada_id`, …) |
+
+**Response (wajib):** HTTP `200` dalam 500ms — gateway membalas body `"OK"`.
+
+Contoh payload product (`message_type` 3/4/5):
+```json
+{
+  "seller_id": "1234567",
+  "message_type": 4,
+  "data": {
+    "item_id": 1760954113,
+    "sku_list": [
+      { "shop_sku": "1760954113_SGAMZ-8970542010", "seller_sku": "SKU-1", "sku_id": 8970542010 }
+    ],
+    "action": "EDITED_UPDATED",
+    "status_update_time": 1623232569146
+  },
+  "timestamp": 1623232569,
+  "site": "LAZADA_SG"
+}
+```
+
+#### Menyimpan payload
+
+Disimpan ke `webhook-data/lazada/<tanggal>_<jam>_<random>.json` dengan
+`shop_id` = `seller_id`, `event_type` = hasil tabel di atas.
+
+### 5.5 Webhook Forwarding (Configurable)
+
+Setiap signal yang masuk ke `/webhook/shopee`, `/webhook/tiktok`, dan
+`/webhook/lazada` bisa **diteruskan (forward) otomatis** ke URL backend Anda. Semua pengaturan ada di
+**satu file JSON yang bisa diedit manual**:
+
+```
+apisix/webhook-config.json   →   /usr/local/apisix/custom/webhook-config.json (container)
+```
+
+Edit file → **langsung berlaku, tanpa restart container**. Bagian file:
+
+| Bagian | Isi |
+|--------|-----|
+| `settings` | Pengaturan global: `enabled`, `timeout_ms`, `max_attempts` (default `3`), `retry_delay_ms`, `default_method`, `payload_mode` (default `"raw"` — body marketplace apa adanya), `signal_code_paths`, `default_headers`, **`queue`** (FIFO + outbox), **`dedup`** (anti duplikat), **`rate_limit`** (pelindung backend) — lihat [§5.6](#56-fifo-dedup-rate-limit--outbox-antrean-webhook) |
+| `targets` | Daftar tujuan forward (aturan tulisan tangan) |
+| `registrations` | Daftar tujuan forward hasil `POST /webhook/register` (dikelola API) |
+
+#### 1) Menambah tujuan forward (manual)
+
+```json
+{
+  "targets": [
+    {
+      "id": "stock-backend",
+      "description": "Hanya stock update, stok > 0",
+      "enabled": true,
+      "marketplace": "all",
+      "signal_codes": [4, 2],
+      "method": "POST",
+      "url": "https://backend-anda.com/webhooks/stock",
+      "headers": { "Authorization": "Bearer TOKEN_ANDA" },
+      "query": { "marketplace": "{{marketplace}}" },
+      "conditions": [
+        { "path": "data.normal_stock", "op": "gt", "value": 0 }
+      ],
+      "payload": {
+        "mode": "custom",
+        "fields": { "item_id": "data.item_id", "stock": "data.normal_stock" },
+        "static": { "source": "marketplace-gateway" }
+      }
+    }
+  ]
+}
+```
+
+> **Bentuk payload.** Default `settings.payload_mode = "raw"` → body webhook
+> marketplace diteruskan **apa adanya** (`code`/`type`, `shop_id`, `timestamp`,
+> `data.*`), sehingga backend bisa mendeteksi marketplace sendiri dari field
+> `type`/`code`. Gunakan `"mode": "wrapped"` **hanya** bila backend memang
+> membaca envelope `{ marketplace, event_type, payload }`. Metadata juga selalu
+> tersedia di header `X-Webhook-Source` tanpa perlu `wrapped`.
+
+#### 2) Filter signal code (tidak semua signal di-forward)
+
+`signal_codes` menentukan **kode signal apa saja** yang boleh di-forward ke target
+itu. Signal di luar daftar **tidak dikirim** (tercatat di log).
+
+| Nilai `signal_codes` | Arti |
+|----------------------|------|
+| `"all"` atau tidak diisi | Semua signal di-forward |
+| `4` | Hanya signal code 4 (Shopee stock update) |
+| `[4, 2]` | Shopee code 4 **dan** TikTok type 2 |
+| `["challenge"]` | Hanya challenge TikTok |
+| `exclude_codes: ["challenge"]` | Semua signal **kecuali** yang disebut |
+
+Kode signal diambil otomatis dari payload sesuai `settings.signal_code_paths`
+(default: Shopee `code`, TikTok `type`) — bisa diubah per target dengan
+`signal_code_path`.
+
+#### 3) Kustomisasi request
+
+| Field | Fungsi |
+|-------|--------|
+| `method` | `GET`, `POST`, `PUT`, `PATCH`, `DELETE` |
+| `url` | Mendukung placeholder `{{data.item_id}}`, `{{shop_id}}`, dll |
+| `headers`, `query` | Nilai mendukung placeholder `{{path}}` |
+| Placeholder tunggal | Bila seluruh nilai hanya `{{path}}`, tipe nilai DIPERTAHANKAN (angka tetap angka) — penting untuk body JSON & variabel Camunda. Placeholder yang bercampur teks selalu menghasilkan string. |
+| `conditions` | Filter tambahan: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `contains`, `in`, `nin`, `exists`, `missing`, `regex` |
+| `condition_mode` | `all` (default) atau `any` |
+| `payload.mode` | `wrapped` (metadata + payload), `raw` (payload apa adanya), `custom` (field pilihan di level atas) |
+| `payload.fields` | Ambil/rename field dari payload: `"nama_output": "path.asli"` |
+| `payload.include` | Ambil field dengan struktur asli (nested): `["data.item_id", "shop_id"]` |
+| `payload.static` | Tambahkan nilai tetap ke payload forward |
+| `payload.include_original` | `true` = sertakan seluruh payload asli lalu ditimpa `fields`/`static` |
+| `payload.wrap_key` | (mode `custom`) bungkus field terpilih dalam satu key |
+| `body` | **Body JSON dinamis** (template `{{path}}`) — menimpa konfigurasi `payload` |
+| `type` | `http` (default) atau `camunda` (start process instance Camunda) |
+| `timeout_ms`, `max_attempts`, `retry_delay_ms` | Override timeout & retry per target |
+
+Bila **beberapa target cocok**, signal di-forward ke **semua** target tersebut.
+Forwarding dijalankan **asinkron** (setelah response ke marketplace dikirim),
+jadi tidak menambah latency webhook.
+
+### 5.6 FIFO, Dedup, Rate Limit & Outbox (antrean webhook)
+
+Ketika webhook datang **bersamaan**, modul `apisix/utils/webhook-queue.lua`
+menjamin empat hal di luar perilaku forward dasar (§5.5):
+
+| Mekanisme | Masalah yang dicegah | Pengatur (`settings.*`, hot-reload) |
+|-----------|----------------------|--------------------------------------|
+| **FIFO per objek** | Dua update untuk shop+entity yang sama (stok item / status order) sampai ke backend **terbalik**. Kunci = `marketplace:shop:entity\|target_id`; INCR atomik di shared dict + `resty.lock` per kunci → urutan dijaga **lintas worker**, sementara objek/target berbeda tetap paralel. | `queue.enabled`, `queue.item_ttl_seconds`, `queue.lock_*` |
+| **Dedup** | Retry marketplace (body byte-identik, termasuk timestamp event) diteruskan 2x → dobel start proses Camunda. Ditangkap via `md5(raw_body)` + TTL; balasan ke marketplace tetap sukses. Challenge TikTok dijawab sebelum dedup. | `dedup.enabled`, `dedup.ttl_seconds` (default 600 dtk) |
+| **Rate limit** | Burst besar membanjiri backend. Jendela 1 detik per marketplace → ditolak `429` + `Retry-After` (marketplace retry nanti). **Dijalankan di dalam webhook-receiver**, bukan plugin `limit-req` bawaan — karena `limit-req` berjalan di fase `access` yang tidak pernah tercapai (receiver selalu `ngx.exit` di fase `rewrite`). Fail-open. | `rate_limit.enabled`, `rate_limit.per_second` (default 100, `0` = mati), `rate_limit.reject_code` |
+| **Outbox** | Forward gagal (backend down) **hilang** — sudah terlanjur 200 ke marketplace. Item gagal ditulis ke `/webhook-data/outbox/` lalu dikirim ulang oleh drainer periodik (backoff linier, **tahan restart**; klaim file via `rename` atomik). Setelah `outbox_max_attempts` → `/webhook-data/outbox/failed/` + payload asli tetap di `/webhook-data/` untuk replay manual. | `queue.outbox_*` |
+
+Retry internal per item: `settings.max_attempts` (default `3`, jeda
+`retry_delay_ms`) — yang habis baru masuk outbox.
+
+**Prasyarat:** `config.yaml` harus mendeklarasikan shared dict (sudah termasuk
+di repo ini):
+
+```yaml
+nginx_config:
+  http_configuration_snippet: |
+    lua_shared_dict webhook_queue 32m;
+```
+
+Bila shared dict tidak tersedia, `enqueue()` gagal → otomatis **fallback ke
+kirim langsung** (perilaku lama, tanpa jaminan urutan) — sistem tetap jalan,
+hanya kehilangan FIFO/outbox. Untuk uji coba dari luar, panggil
+`require("utils.webhook-queue").drain_outbox_now()` atau lihat `.stats()`.
+
+#### 4) Forward ke Camunda — start process via API
+
+Set `"type": "camunda"` untuk **men-start process instance Camunda** dari signal
+marketplace. Payload start-process dibangun otomatis dari mapping variabel
+(`camunda.variables`) — jadi tidak perlu menyusun JSON Camunda manual.
+
+| Field | Fungsi |
+|-------|--------|
+| `camunda.version` | `7` (default, REST `/engine-rest`) atau `8` (Orchestration/Zeebe REST `/v2`) |
+| `camunda.base_url` | Base URL engine (URL endpoint dibangun otomatis) |
+| `camunda.path` | Override path endpoint bila perlu |
+| `camunda.process_definition_key` | BPMN process id / key (v7: `.../process-definition/key/{key}/start`, v8: `processDefinitionId`) |
+| `camunda.process_definition_id` | (v7) pakai ID versi spesifik: `.../process-definition/{id}/start` |
+| `camunda.message_name` | (v7) start lewat message event: `POST /engine-rest/message` |
+| `camunda.business_key` | Business key (mendukung placeholder `{{shop_id}}`, dll) |
+| `camunda.business_key_field` | Nama field bisnis key di body (`businessKey`, atau `businessId` untuk Camunda 8.9+) |
+| `camunda.variables` | Map `namaVariabel → nilai` (lihat aturan di bawah) |
+| `camunda.extra` | Field tambahan / override di root body Camunda (template `{{path}}` didukung) |
+| `camunda.variable_types` | (v7) paksa tipe variabel: `"itemId": "Long"` — default otomatis (Boolean/Long/Double/Json/String). Bila tipe numerik dipaksa tapi nilainya bukan angka, gateway menulis **warning** di log (Camunda akan menolak dengan 400) |
+| `camunda.typed_variables` | `true` = bentuk `{value,type}` (default untuk v7); `false` = nilai polos (default v8) |
+| `camunda.with_variables_in_return` / `result_enabled` / `await_completion` | Opsi respons Camunda |
+| `camunda.tenant_id` | Tenant ID |
+| `camunda.extra` | Field tambahan / override di root body Camunda |
+
+**Aturan nilai di `camunda.variables` (deterministik, penting agar variabel tidak berisi data sampah):**
+
+| Bentuk | Perilaku |
+|--------|----------|
+| `{ "path": "data.item_id" }` | Ambil dari payload; bila path **tidak ada** → variabel **dilewati** (+ warning log) |
+| `{ "literal": <nilai apa pun> }` | Nilai tetap, tanpa cek payload |
+| `"{{data.item_id}}"` | Template; bila path tidak ada → string kosong |
+| `"data.item_id"` (mengandung titik) | Path payload; bila tidak ada → variabel **dilewati** (+ warning) |
+| `"shop_id"` (tanpa titik) | Path payload bila ada; bila tidak ada → **string literal** |
+| angka / boolean / tabel | Nilai tetap |
+
+> Karena itu, aman memakai satu target `marketplace: "all"` untuk Shopee + TikTok:
+> variabel yang tidak relevan (mis. `data.item_id` pada signal TikTok) otomatis
+> dilewati, sementara `"source": "gateway"` tetap dikirim sebagai literal.
+> Ingin process berbeda per marketplace? Buat target terpisah dengan
+> `marketplace` dan `process_definition_key` masing-masing.
+
+**Contoh — Camunda 7 (stock update):**
+
+```json
+{
+  "id": "camunda7-stock",
+  "type": "camunda",
+  "enabled": true,
+  "marketplace": "all",
+  "signal_codes": [4, 2],
+  "camunda": {
+    "version": 7,
+    "base_url": "https://camunda-anda.com",
+    "process_definition_key": "stock-sync",
+    "business_key": "{{marketplace}}-{{shop_id}}-{{data.item_id}}",
+    "with_variables_in_return": true,
+    "variables": {
+      "marketplace": "{{marketplace}}",
+      "shopId": "shop_id",
+      "itemId": "data.item_id",
+      "stock": "data.normal_stock"
+    },
+    "variable_types": { "itemId": "Long", "shopId": "Long" }
+  },
+  "headers": { "Authorization": "Basic BASE64_USER_PASSWORD" }
+}
+```
+
+→ `POST https://camunda-anda.com/engine-rest/process-definition/key/stock-sync/start`
+
+**Contoh — Camunda 8 + body bebas (payload sepenuhnya dinamis):**
+
+```json
+{
+  "id": "camunda8-produk",
+  "type": "camunda",
+  "enabled": true,
+  "marketplace": "tiktok",
+  "signal_codes": [2],
+  "url": "https://cluster.camunda.io/CLUSTER_ID/v2/process-instances",
+  "body": {
+    "processDefinitionId": "tiktok-stock-sync",
+    "businessKey": "{{shop_id}}-{{data.product_id}}",
+    "variables": {
+      "marketplace": "{{marketplace}}",
+      "productId": "{{data.product_id}}",
+      "source": "marketplace-gateway"
+    },
+    "awaitCompletion": false
+  },
+  "headers": { "Authorization": "Bearer CAMUNDA_TOKEN" }
+}
+```
+
+> Blok `body` berlaku untuk **semua** tipe target (bukan hanya Camunda) dan
+> menimpa `payload` — inilah cara membuat payload forward sepenuhnya dinamis.
+> Ingin signal berbeda men-start process berbeda? Buat beberapa target `camunda`
+> dengan `signal_codes` dan `process_definition_key` masing-masing — gateway akan
+> men-start semua process yang cocok.
+
+#### 5) Registrasi lewat API
+
+```bash
+# Daftarkan URL backend (semua signal)
+curl -X POST http://localhost:9080/webhook/register \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://backend-anda.com/webhooks/all"}'
+
+# Daftarkan URL yang hanya menerima signal code tertentu + header + filter
+curl -X POST http://localhost:9080/webhook/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "stock-only",
+    "url": "https://backend-anda.com/webhooks/stock",
+    "signal_codes": [4, 2],
+    "method": "POST",
+    "headers": { "Authorization": "Bearer TOKEN" },
+    "conditions": [{"path": "data.normal_stock", "op": "gt", "value": 0}],
+    "payload": {"mode": "custom", "fields": {"item_id": "data.item_id"}}
+  }'
+
+# Daftarkan start-process Camunda 7 (hanya signal stock)
+curl -X POST http://localhost:9080/webhook/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "camunda-stock",
+    "type": "camunda",
+    "signal_codes": [4, 2],
+    "camunda": {
+      "version": 7,
+      "base_url": "https://camunda-anda.com",
+      "process_definition_key": "stock-sync",
+      "business_key": "{{shop_id}}-{{data.item_id}}",
+      "variables": { "itemId": "data.item_id", "stock": "data.normal_stock" }
+    }
+  }'
+
+# Matikan / nyalakan tanpa mengubah URL
+curl -X POST http://localhost:9080/webhook/register \
+  -H "Content-Type: application/json" -d '{"id": "stock-only", "enabled": false}'
+
+# Hapus target
+curl -X POST http://localhost:9080/webhook/register \
+  -H "Content-Type: application/json" -d '{"id": "stock-only", "remove": true}'
+
+# Lihat konfigurasi yang berlaku
+curl http://localhost:9080/webhook/register
+```
+
+Semua target bisa juga dinonaktifkan sekaligus dengan `"settings": {"enabled": false}`.
+
+### 5.7 Data Storage
 
 Semua payload webhook disimpan ke file JSON di direktori `webhook-data/`:
 
@@ -1205,8 +1735,11 @@ webhook-data/
 ├── shopee/
 │   ├── 2026-07-03_142530_a1b2c3d4.json
 │   └── ...
-└── tiktok/
-    ├── 2026-07-03_142531_e5f6g7h8.json
+├── tiktok/
+│   ├── 2026-07-03_142531_e5f6g7h8.json
+│   └── ...
+└── lazada/
+    ├── 2026-07-03_142532_i9j0k1l2.json
     └── ...
 ```
 
@@ -1223,7 +1756,7 @@ Format file:
 }
 ```
 
-### 5.6 Simulasi Webhook
+### 5.8 Simulasi Webhook
 
 Gunakan curl untuk simulasi:
 
@@ -1274,6 +1807,32 @@ curl -X POST http://localhost:9080/webhook/tiktok \
     "challenge": "test_challenge_123",
     "shop_id": "7494709429666874412"
   }'
+
+# Simulasi Lazada push — order status (message_type=0)
+curl -X POST http://localhost:9080/webhook/lazada \
+  -H "Content-Type: application/json" \
+  -d '{
+    "seller_id": "1234567",
+    "message_type": 0,
+    "data": {
+      "order_status": "ready_to_ship",
+      "trade_order_id": "260422900198363",
+      "trade_order_line_id": "260422900298363",
+      "status_update_time": 1603698638
+    },
+    "timestamp": 1603766859530,
+    "site": "lazada_sg"
+  }'
+
+# Simulasi Lazada push + signature (Authorization = hex HMAC-SHA256)
+SECRET='YOUR_LAZADA_APP_SECRET'
+APP_KEY='YOUR_LAZADA_APP_KEY'
+BODY='{"seller_id":"1234567","message_type":0,"data":{"order_status":"shipped","trade_order_id":"260422900198363","trade_order_line_id":"260422900298363","status_update_time":1603698638},"timestamp":1603766859530,"site":"lazada_sg"}'
+SIG=$(printf '%s%s' "$APP_KEY" "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | sed 's/^.* //')
+curl -X POST http://localhost:9080/webhook/lazada \
+  -H "Content-Type: application/json" \
+  -H "Authorization: $SIG" \
+  -d "$BODY"
 ```
 
 ## 6. Product Endpoints
@@ -1342,6 +1901,7 @@ GET http://localhost:9080/products
 | `page_token`  | string   | ❌       | —       | Cursor pagination (**TikTok**). Isi dengan `next_page_token` dari response sebelumnya untuk halaman berikutnya (alias: `next_page_token`) |
 | `keyword`     | string   | ❌       | —       | Kata kunci pencarian produk (max: 200 karakter)       |
 | `status`      | string   | ❌       | —       | Filter status produk: `"ACTIVE"`, `"INACTIVE"`, `"DELETED"` |
+| `listing_platforms` | string | ❌   | —       | Filter platform listing (**TikTok only**). Dipisah koma, mis. `TIKTOK_SHOP` atau `TIKTOK_SHOP,TOKOPEDIA`. Berguna untuk seller migrasi Tokopedia yang ingin membatasi hasil pencarian ke platform tertentu. Juga bisa dikirim via POST body (lihat di bawah) |
 | `translate`   | boolean  | ❌       | `true`  | `false` → kembalikan response **enriched RAW** (body marketplace + `_detail`/`_model_raw`/stock) TANPA standarisasi ke unified schema. `true` (default) → response terstandarisasi |
 
 #### Contoh Request
@@ -1372,7 +1932,25 @@ curl "http://localhost:9080/products?marketplace=tiktok&shop_uuid=74947094296668
 
 # Response asli (enriched RAW) — tanpa standarisasi ke unified schema
 curl "http://localhost:9080/products?marketplace=shopee&shop_uuid=227674818&translate=false"
+
+# TikTok — filter platform listing (mis. hanya TIKTOK_SHOP, untuk seller migrasi Tokopedia)
+curl "http://localhost:9080/products?marketplace=tiktok&shop_uuid=7494709429666874412&listing_platforms=TIKTOK_SHOP"
+
+# TikTok — multi platform
+curl "http://localhost:9080/products?marketplace=tiktok&shop_uuid=7494709429666874412&listing_platforms=TIKTOK_SHOP,TOKOPEDIA"
+
+# TikTok — via POST body (setara query param, cocok jika filter-nya banyak)
+curl -X POST "http://localhost:9080/products?marketplace=tiktok&shop_uuid=7494709429666874412" \
+  -H "Content-Type: application/json" \
+  -d '{"listing_platforms": ["TIKTOK_SHOP"]}'
 ```
+
+> **ℹ️ Param `listing_platforms` (TikTok only):**
+> - Filter body TikTok **Search Products API** (`POST /product/202309/products/search`).
+> - Bisa dikirim sebagai **query param** (string dipisah koma) atau **POST body** (JSON array).
+> - Nilai valid mengikuti TikTok API: `TIKTOK_SHOP`, `TOKOPEDIA`. Gateway otomatis uppercase + trim.
+> - Hanya berlaku untuk `marketplace=tiktok` — Shopee mengabaikan param ini.
+> - Tidak dikirim → TikTok mengembalikan produk dari semua platform (perilaku default API).
 
 > **ℹ️ Param `translate`:**
 > - `translate=false` → response tetap di-enrich (field `_detail`, `_model_raw`, stock dipromosikan ke top-level) tapi **tidak** di-transform ke schema unified `products[].{id,title,stock,...}`. Berguna untuk debugging pipeline / melihat data mentah marketplace.
@@ -1562,7 +2140,7 @@ curl "http://localhost:9080/products/1736033390941733932?marketplace=tiktok&shop
 
 ---
 
-### 6.4 GET /order — Order List & Detail (Shopee & TikTok)
+### 6.4 GET /order — Order List & Detail (Shopee, TikTok & Lazada)
 
 Satu endpoint dinamis untuk **order** — menggabungkan **Get Order List** dan **Get Order Detail** Shopee & TikTok dalam satu route. Routing otomatis ditentukan oleh parameter `ids`:
 
@@ -1602,6 +2180,8 @@ GET http://localhost:9080/order?marketplace=shopee&shop_uuid=227674818
 | `is_buyer_request_cancel` | boolean | ❌       | —                                      | TikTok: filter order dengan permintaan cancel dari buyer                     |
 | `warehouse_ids`         | string   | ❌       | —                                        | TikTok: filter gudang — pisahkan dengan koma (multi-warehouse)              |
 | `translate`             | boolean  | ❌       | `true`                                   | `false` → raw (merged) response marketplace tanpa normalisasi               |
+| `product_id`            | string   | ❌       | —                                        | **Filter ter-target** — hanya kembalikan reserved stock SATU produk (Shopee `item_id` / TikTok `product_id`). Hasil disertai blok `filtered_by`. Hanya untuk `translate=true`. |
+| `variant_id`            | string   | ❌       | —                                        | Saring per variant (Shopee `model_id` / TikTok `sku_id`); boleh dipakai bersama `product_id`. |
 
 > **Perilaku default (tanpa parameterisasi):** `GET /order?marketplace=...&shop_uuid=...`
 > mengambil status default per marketplace — karena TikTok & Shopee hanya menerima
@@ -1610,6 +2190,21 @@ GET http://localhost:9080/order?marketplace=shopee&shop_uuid=227674818
 > - **TikTok** (3 call): `UNPAID`, `ON_HOLD`, `AWAITING_SHIPMENT`
 > - **Shopee** (2 call): `UNPAID`, `READY_TO_SHIP`
 >
+> **Filter `product_id` / `variant_id` (reserved stock per produk):**
+> - **Sumber status tetap sama** dengan `/order` biasa (TikTok `UNPAID`/`ON_HOLD`/`AWAITING_SHIPMENT`,
+>   Shopee `UNPAID`/`READY_TO_SHIP`) — jadi hasilnya identik dengan reserved stock
+>   yang selama ini dipakai, hanya dibatasi ke satu produk/variant.
+> - **Filter diterapkan di gateway SETELAH merge + agregasi**, dan response disertai
+>   blok `filtered_by`. Bila tidak ada order yang cocok, `reserved_stock` balas `[]`
+>   (tetap array).
+> - **Jujur soal biaya:** marketplace **tidak** punya filter order per item/product
+>   (Shopee `get_order_list` & TikTok `orders/search` hanya menyaring `order_status` +
+>   rentang waktu), jadi gateway **tetap menarik order yang sama**. Yang dihemat adalah
+>   ukuran payload & kerja parsing konsumen — **bukan** jumlah panggilan ke marketplace.
+>   Panggilan tetap murah karena hanya 1 request `/order` (gateway yang menarik semua halaman).
+> - `translate=false` (mode raw) **tidak difilter** — shape mentah marketplace tidak
+>   memuat `reserved_stock` untuk disaring.
+
 > **Shopee note:** Get Order List hanya mengembalikan `order_sn` + `order_status` per order.
 > Gateway otomatis **enrich** hasil merge dengan **Get Order Detail** (batch max 50
 > `order_sn` per call) sehingga field lengkap (item_list, recipient_address, dll)
@@ -1664,6 +2259,13 @@ curl "http://localhost:9080/order?marketplace=shopee&shop_uuid=227674818&ids=210
 
 # Raw mode — lihat response asli Shopee (tanpa normalisasi)
 curl "http://localhost:9080/order?marketplace=shopee&shop_uuid=227674818&translate=false"
+
+# Reserved stock SATU produk saja (tanpa menerima seluruh reserved stock toko)
+curl "http://localhost:9080/order?marketplace=shopee&shop_uuid=227674818&product_id=802023254"
+curl "http://localhost:9080/order?marketplace=tiktok&shop_uuid=7494709429666874412&product_id=1729592969712207008"
+
+# Reserved stock SATU variant (lebih spesifik lagi, boleh digabung product_id)
+curl "http://localhost:9080/order?marketplace=shopee&shop_uuid=227674818&product_id=802023254&variant_id=11250494"
 ```
 
 #### Success Response (200 OK)
@@ -1741,6 +2343,322 @@ Response ini **menggantikan** array `orders` & `pagination` pada versi sebelumny
 > (Shopee: `model_id`) yang sama, lalu di-*grouping* per variant (`variant_id`) dan per product.
 > Gunakan `translate=false` untuk melihat response asli marketplace
 > (TikTok: `data.orders[]` · Shopee: `response.order_list[]`).
+
+### 6.5 POST /ship-order — Ship Order & Ship Package (Shopee & TikTok)
+
+Endpoint dinamis dan terpadu untuk melakukan proses pengiriman pesanan (fulfillment / shipment) ke kurir / pihak logistik untuk marketplace Shopee dan TikTok Shop.
+
+Gateway secara cerdas mengonversi request terpadu (atau request native) ke spesifikasi masing-masing platform:
+- **Shopee**: Mengarah ke API `POST /api/v2/logistics/ship_order`
+- **TikTok Shop**: Mengarah ke API `POST /fulfillment/202309/packages/{package_id}/ship`
+
+#### URL & Alias Path
+
+Gateway menyediakan beberapa alias path yang dapat digunakan secara fleksibel:
+- `POST /ship-order` atau `POST /ship-order/{id}`
+- `POST /ship` atau `POST /ship/{id}`
+- `POST /ship-package` atau `POST /ship-package/{id}`
+
+> 💡 **Fleksibilitas ID:** ID pesanan / paket dapat dicantumkan langsung di URL path (misal: `/ship-order/241020XYZ` atau `/ship-order/PKG12345`) ataupun di body JSON (`order_sn` untuk Shopee, `package_id` untuk TikTok). Jika ID dicantumkan di URL path, gateway akan memprioritaskannya.
+
+#### Query Parameters
+
+| Parameter | Tipe | Wajib? | Keterangan |
+| :--- | :--- | :--- | :--- |
+| `marketplace` | `string` | **Ya** | `shopee` atau `tiktok`. **Catatan:** Fan-out (`all`) **tidak didukung** karena pengiriman bersifat spesifik per-toko / per-pesanan. |
+| `shop_uuid` / `shop_id` | `string` | **Ya** | UUID shop yang terdaftar di `credentials/credentials.json`. Dapat juga dikirimkan melalui header `X-Shop-Id`. |
+| `translate` | `boolean` | Tidak | Default `true`. Jika `true`, gateway mengembalikan format respon terpadu (unified). Jika `false`, mengembalikan respon mentah (raw) dari marketplace. |
+
+#### Standardized Request Body (Unified — Direkomendasikan)
+
+Client cukup mengirim **satu bentuk body** untuk Shopee & TikTok Shop. Gateway yang memilih metode dan menerjemahkannya ke bentuk native masing-masing marketplace.
+
+| Field | Tipe | Wajib | Keterangan |
+| :--- | :--- | :--- | :--- |
+| `order_id` | `string` | **Ya** | ID pesanan (Shopee `order_sn`) atau ID paket (TikTok `package_id`). Alias lama `order_sn` / `package_id` tetap diterima. |
+| `handover_method` | `string` | **Ya\*** | `PICKUP`, `DROP_OFF`, `NON_INTEGRATED`, atau `SELF_SHIPMENT`. Alias native (`PICK_UP`, `DROPOFF`, `SELF_SHIPPED`) dinormalkan otomatis. \*Bisa diinferensi dari objek `pickup` / `dropoff` / `non_integrated` / `self_shipment`. |
+| `package_number` | `string` | Tidak | Khusus Shopee split order. Key dihilangkan jika kosong. |
+| `pickup.address_id` | `integer` | Ya untuk Shopee `PICKUP` | ID alamat penjemputan. |
+| `pickup.time_slot_id` | `string` | Tidak | ID slot native Shopee → `pickup.pickup_time_id`. |
+| `pickup.start_time` / `pickup.end_time` | `integer` | Ya untuk TikTok `PICKUP` (minimal salah satu) | Unix timestamp detik → `pickup_slot`. `end_time` default = `start_time` + durasi config. |
+| `dropoff.branch_id` / `dropoff.sender_real_name` / `dropoff.slug` / `dropoff.tracking_number` | campuran | Tidak | Diteruskan ke Shopee `dropoff`. |
+| `non_integrated.tracking_number` | `string` | Ya untuk `NON_INTEGRATED` / `SELF_SHIPMENT` | Nomor resi pengiriman non-integrasi. |
+| `self_shipment.tracking_number` / `self_shipment.shipping_provider_id` | `string` | `tracking_number` wajib | TikTok `self_shipment`; Shopee `non_integrated`. |
+
+Field **flat** (`address_id`, `pickup_time_id`, `start_time`, `end_time`, `tracking_number`, `branch_id`, `sender_real_name`, `slug`, `shipping_provider_id`) tetap didukung agar request lama tidak rusak.
+
+**Contoh — satu body untuk dua marketplace:**
+```json
+{
+  "order_id": "241020ABCD1234",
+  "handover_method": "PICKUP",
+  "pickup": {
+    "address_id": 123456,
+    "time_slot_id": "SLOT-123",
+    "start_time": 1718000000,
+    "end_time": 1718007200
+  }
+}
+```
+
+**Matriks translasi gateway:**
+
+| `handover_method` | Shopee (`ship_order`) | TikTok (`ship`) |
+| :--- | :--- | :--- |
+| `PICKUP` | `pickup: { address_id, pickup_time_id }` | `handover_method: "PICKUP"` + `pickup_slot: { start_time, end_time }` |
+| `DROP_OFF` | `dropoff: { branch_id, sender_real_name, slug, tracking_number }` | `handover_method: "DROP_OFF"` |
+| `NON_INTEGRATED` | `non_integrated: { tracking_number }` | `self_shipment: { tracking_number, shipping_provider_id }` |
+| `SELF_SHIPMENT` | `non_integrated: { tracking_number }` | `self_shipment: { tracking_number, shipping_provider_id }` |
+
+> ⚠️ Alias `/request-pickup` dan `/pickup` khusus `PICKUP`. Mengirim `handover_method` lain ke alias tersebut ditolak `400 INVALID_PARAMETER`.
+
+> 🛠️ **TikTok — `handover_method` / `pickup_slot` & error `36009003`.**
+> Sejak 30 Okt 2024 TikTok **mengabaikan** `handover_method` untuk seller **lokal market SEA** (`ID`, `SG`, `PH`, `VN`, `TH`, `MY`): metode pengambilan diambil dari setelan warehouse di Seller Center (*Orders → Manage Orders → Fulfillment settings → Collection method settings*).
+> Bila gateway tetap mengirim `pickup_slot` yang **sudah lewat / tidak berlaku**, TikTok membalas HTTP 200 dengan `code 36009003` — "Internal error. Retry later." — yang oleh gateway dipetakan menjadi `UPSTREAM_ERROR` (HTTP 500) dan tidak bisa ditindaklanjuti pemanggil.
+> Karena itu gateway menanganinya otomatis:
+> 1. **Window pickup sudah lewat** (`end_time` ≤ sekarang) → parameter handover (`handover_method`, `pickup_slot`, `pickup`, `start_time`, `end_time`, `address_id`, `pickup_time_id`, `time_slot_id`) dibuang sebelum request dikirim, sehingga TikTok memakai *collection method* default. Dicatat sebagai log `WARN` `"window pickup sudah lewat"`.
+> 2. **Fallback `36009003`** → bila TikTok tetap membalas `36009003` padahal request membawa parameter handover, gateway **mengulang sekali** tanpa parameter handover (log `WARN` `"mengulang tanpa parameter handover"`).
+>
+> `self_shipment` (`tracking_number` + `shipping_provider_id`) **tidak** dihapus oleh kedua penanganan di atas karena tetap dipakai paket seller shipping.
+>
+> 🔧 **Shopee — `pickup_time_id` opsional & error `ship_order_pickup_time_invalid`.**
+> `pickup.pickup_time_id` Shopee **opsional**: nilai valid didapat dari API `get_pickup_time_id`, dan bila dilepas Shopee menentukan jadwal penjemputan sendiri.
+> Nilai yang tidak valid (mis. `time_slot_id` dummy dari client) membuat Shopee menolak seluruh ship dengan `logistics.ship_order_pickup_time_invalid` — "Invalid pickup time id. Please check the pick up time id."
+> Bila Shopee menolak `pickup_time_id`, gateway **mengulang sekali** tanpa nilai itu. Seluruh sumbernya ikut dibuang (`time_slot_id`, `pickup_time_id`, `start_time`, `pickup_slot`, `pickup.start_time`) supaya request_map tidak menjatuhkan nilai ke sumber berikutnya; `address_id`, `tracking_number`, dan `package_number` tetap dikirim. Log `WARN`: `"Shopee menolak pickup_time_id"`.
+>
+> 📦 **Shopee — `package_number` hanya untuk order split.**
+> Hasil scanning (GET order detail → `package_list`) sekarang dihitung dulu: order dengan **satu paket (unsplit)** dikirim **tanpa** `package_number` (ship cukup per `order_sn`), karena Shopee menolaknya dengan `logistics.ship_order_not_need_pacakge_number` (ejaan "pacakge" itu typo dari Shopee) — "Please don't request with package_number for this unsplit order."
+> Order dengan **lebih dari satu paket** (split) tetap di-ship per paket dengan `package_number` masing-masing.
+> Cadangan bila `package_number` tetap terkirim (mis. dikirim eksplisit oleh client) dan ditolak Shopee: gateway **mengulang sekali** tanpa `package_number`. Dua perintah ulang Shopee ini tersusun berantai (pickup_time_id → package_number, maksimal 2x ulang per item). Log `WARN`: `"Shopee menolak package_number (order unsplit)"`.
+>
+> 🏠 **Shopee PICKUP — scanning alamat & jadwal (`get_shipping_parameter`).**
+> `address_id` dan `pickup_time_id` yang valid harus berasal dari Shopee; nilai placeholder (mis. `address_id: 123456`, `time_slot_id: "SLOT-123"`) membuat Shopee membalas error generik `error_server` — "Something wrong. Please try later."
+> Karena itu untuk **setiap ship PICKUP**, gateway memanggil `POST /api/v2/logistics/get_shipping_parameter` (per `order_sn`) **sebelum** ship, lalu:
+> - nilai **client dipertahankan** bila terdaftar resmi di hasil scan;
+> - selain itu dipakai kandidat pertama hasil scan;
+> - semua sumber placeholder (`time_slot_id`, `pickup_time_id`, `start_time`, `pickup_slot`, flat `address_id`) dibuang dulu supaya request_map tidak menjatuhkan nilai ke sumber cadangan.
+>
+> Bila pemanggilan scan gagal, gateway tetap lanjut memakai nilai dari client (di-log `WARN`) — ship kemudian bisa ditolak Shopee sesuai aturan di atas. Log `INFO`: `"scanning Shopee pickup selesai"` (berisi `address_id` + `pickup_time_id` terpilih).
+> Endpoint internalnya terdaftar di `endpoint-mapping.lua` → `shipping_parameter` (path bisa di-override via `update-config.json` → `endpoints.shipping_parameter.shopee.api`).
+
+**Konfigurasi (dinamis tanpa ubah kode)**
+
+Semua mapping variabel ship order ada di `apisix/update-config.json` → `endpoints.ship_order`:
+
+| Key | Fungsi |
+| :--- | :--- |
+| `handover_aliases` | Alias nilai `handover_method` → enum unified (`PICK_UP` → `PICKUP`, dst.). |
+| `infer_order` | Urutan deteksi metode bila client tidak mengirim `handover_method`. |
+| `<marketplace>.enabled` | `false` memblokir endpoint (403 `ENDPOINT_DISABLED`). |
+| `<marketplace>.api` | Path + method API native. Override `endpoint-mapping.lua` tanpa deploy kode. |
+| `<marketplace>.request_map` | Mapping field standar → field native per metode (lihat skema di bawah). |
+| `<marketplace>.updatable_fields` / `field_map` | Whitelist field tambahan yang boleh diteruskan. |
+| `<marketplace>.options.default_pickup_duration_seconds` | Durasi slot TikTok bila hanya `start_time` dikirim (default `7200`). |
+
+**Skema `request_map`:**
+
+```json
+"request_map": {
+  "root_fields": [
+    { "target": "order_sn", "sources": ["order_id", "order_sn", "package_id", "@order_id"], "type": "string" }
+  ],
+  "methods": {
+    "PICKUP": {
+      "infer_sources": ["pickup", "pickup_slot", "address_id"],
+      "fields": [
+        { "target": "pickup.address_id", "sources": ["pickup.address_id", "address_id"], "type": "integer" },
+        { "target": "pickup.pickup_time_id", "sources": ["pickup.time_slot_id", "pickup_time_id"], "type": "string" }
+      ]
+    }
+  },
+  "excluded_root_fields": ["order_id", "address_id", "pickup_time_id"]
+}
+```
+
+- `target` — dot-path field native tujuan (`pickup.address_id` membuat objek bersarang).
+- `sources` — daftar dot-path field standar; nilai pertama yang ada dipakai. Prefix `@` membaca query/path params (`@order_id` untuk `/ship-order/{id}`).
+- `value` — nilai literal (mis. `{ "target": "handover_method", "value": "DROP_OFF" }`).
+- `type` — `string` | `integer` | `number` | `boolean`.
+- `default` — nilai turunan: `{ "from": "pickup_slot.start_time", "option": "default_pickup_duration_seconds", "op": "add" }` (`op`: `add` / `subtract`).
+- `excluded_root_fields` — field standar yang tidak boleh bocor ke root body native lewat passthrough.
+
+Contoh menambah variabel baru: tambahkan rule ke `request_map.methods.<METODE>.fields`, lalu restart APISIX. Tidak perlu mengedit `parameter-mapping.lua`.
+
+> ℹ️ File config dibaca ulang setelah APISIX di-restart (cache config per worker).
+
+#### Body Parameters & Spesifikasi Marketplace
+
+> Bagian di bawah menjelaskan format **native** masing-masing marketplace. Format standar di atas otomatis diterjemahkan oleh gateway.
+
+##### 1. Shopee (`POST /api/v2/logistics/ship_order`)
+Sesuai dokumen resmi Shopee Open Platform:
+- `order_sn` (`string`, wajib): Nomor pesanan Shopee.
+- `package_number` (`string`, opsional): Nomor paket jika order dipisah (*split order*).
+  > ⚠️ **Aturan Khusus Gateway:** Jika pesanan bukan split order (atau `package_number` kosong), gateway secara otomatis **meniadakan** key ini dari payload request ke Shopee untuk mencegah error validasi `error_param` dari upstream Shopee.
+- **Metode Pengiriman** (Wajib memilih salah satu opsi yang didukung channel pengiriman toko):
+  - **Dropoff** (`object`): Pengantaran ke gerai kurir
+    - `branch_id` (`integer`, opsional): ID cabang gerai dropoff (bisa didapatkan dari `/api/v2/logistics/get_shipping_parameter`).
+    - `sender_real_name` (`string`, opsional): Nama lengkap pengirim.
+    - `tracking_number` (`string`, opsional): Nomor resi (wajib untuk beberapa 3PL).
+    - `slug` (`string`, opsional): Kode slug kurir.
+  - **Pickup** (`object`): Penjemputan kurir ke gudang seller
+    - `address_id` (`integer`, wajib jika pickup): ID alamat penjemputan.
+    - `pickup_time_id` (`string`, opsional): Slot waktu penjemputan.
+  - **Non-Integrated** (`object`): Pengiriman kurir non-integrasi
+    - `tracking_number` (`string`, wajib jika non-integrated): Nomor resi fisik.
+
+> 🌟 **Dukungan Format Flat (Unified):** Anda juga dapat mengirimkan parameter langsung pada root body tanpa membungkusnya dalam objek:
+> ```json
+> {
+>   "order_sn": "241020ABCD1234",
+>   "address_id": 123456,
+>   "pickup_time_id": "1718000000"
+> }
+> ```
+> Gateway secara otomatis merestrukturisasi payload menjadi format nested yang valid untuk Shopee.
+
+##### 2. TikTok Shop (`POST /fulfillment/202309/packages/{package_id}/ship`)
+Sesuai dokumen `Ship Package.md` TikTok Shop Partner:
+- `package_id` (`string`, wajib): ID paket TikTok. Otomatis disubstitusikan ke path URL TikTok: `/fulfillment/202309/packages/{package_id}/ship`.
+- `handover_method` (`string`, wajib jika bukan self-shipment):
+  - `"PICKUP"`: Kurir menjemput paket ke gudang.
+  - `"DROP_OFF"`: Seller mengantar paket ke lokasi dropoff point kurir.
+- `pickup_slot` (`object`, opsional jika PICKUP):
+  - `start_time` (`integer`): Unix timestamp awal penjemputan dalam detik.
+  - `end_time` (`integer`): Unix timestamp akhir penjemputan dalam detik.
+- `self_shipment` (`object`, opsional):
+  - `tracking_number` (`string`): Nomor resi pengiriman mandiri.
+  - `shipping_provider_id` (`string`): ID jasa kirim pengiriman mandiri.
+
+---
+
+#### Contoh Penggunaan (cURL & Request Body)
+
+##### Contoh 1: Shopee Drop-off
+```bash
+curl -X POST "http://localhost:9080/ship-order?marketplace=shopee" \
+  -H "X-Shop-Id: my-shopee-shop" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "order_sn": "241020ABCD1234",
+    "dropoff": {
+      "branch_id": 12345,
+      "sender_real_name": "Gudang Pusat"
+    }
+  }'
+```
+
+##### Contoh 2: Shopee Pick-up (Flat Unified Body)
+```bash
+curl -X POST "http://localhost:9080/ship-order?marketplace=shopee" \
+  -H "X-Shop-Id: my-shopee-shop" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "order_sn": "241020ABCD1234",
+    "address_id": 987654,
+    "pickup_time_id": "1718000000"
+  }'
+```
+
+##### Contoh 3: TikTok Shop Drop-off (ID di URL Path)
+```bash
+curl -X POST "http://localhost:9080/ship-order/PKG1736673915168?marketplace=tiktok" \
+  -H "X-Shop-Id: my-tiktok-shop" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "handover_method": "DROP_OFF"
+  }'
+```
+
+##### Contoh 4: TikTok Shop Pick-up dengan Slot Waktu
+```bash
+curl -X POST "http://localhost:9080/ship-order?marketplace=tiktok" \
+  -H "X-Shop-Id: my-tiktok-shop" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "package_id": "PKG1736673915168",
+    "handover_method": "PICKUP",
+    "pickup_slot": {
+      "start_time": 1718000000,
+      "end_time": 1718007200
+    }
+  }'
+```
+
+---
+
+#### Format Response
+
+##### Response Sukses Terpadu (`translate=true`, Default)
+```json
+{
+  "success": true,
+  "marketplace": "shopee",
+  "data": {
+    "order_sn": "241020ABCD1234",
+    "package_number": null,
+    "status": "SHIPPED",
+    "shipped_at": 1718001234,
+    "tracking_number": "SPXID0123456789",
+    "handover_method": "DROP_OFF",
+    "raw": {}
+  }
+}
+```
+
+##### Response Sukses TikTok Shop Terpadu (`translate=true`)
+```json
+{
+  "success": true,
+  "marketplace": "tiktok",
+  "data": {
+    "package_id": "PKG1736673915168",
+    "status": "SHIPPED",
+    "shipped_at": 1718001234,
+    "handover_method": "DROP_OFF",
+    "raw": {}
+  }
+}
+```
+
+##### Response Mentah (`translate=false`)
+Jika `translate=false`, respon langsung dari upstream marketplace dikembalikan:
+- **Shopee Raw**: `{ "error": "", "message": "", "response": {}, "request_id": "..." }`
+- **TikTok Raw**: `{ "code": 0, "message": "Success", "data": {}, "request_id": "..." }`
+
+---
+
+#### Error Handling & Kode Error Resmi
+
+Bila terjadi kegagalan, gateway mengembalikan format respon error standar:
+```json
+{
+  "error": {
+    "code": "UPSTREAM_ERROR",
+    "message": "The order status does not support ship order.",
+    "marketplace": "shopee",
+    "original_status": 400,
+    "original_code": "logistics.status_not_support_ship_order",
+    "request_id": "c1f7a28e-5b14-4a27-a12f-987456bcde12"
+  }
+}
+```
+
+##### Kode Error Shopee (`ship_order`):
+- `error_param`: Parameter yang dikirim tidak valid atau terdapat format yang salah (misal `package_number` dikirim string kosong pada non-split order).
+- `error_data`: Data pesanan tidak ditemukan di Shopee.
+- `logistics.status_not_support_ship_order`: Status pesanan saat ini belum siap dikirim (misal masih UNPAID atau sudah CANCELLED).
+- `logistics.channel_not_support_dropoff`: Saluran logistik pesanan ini tidak mendukung metode Dropoff.
+- `logistics.channel_not_support_pickup`: Saluran logistik pesanan ini tidak mendukung metode Pickup.
+- `logistics.address_not_support_pickup`: Alamat penjemputan tidak valid atau belum disetup.
+- `logistics.empty_tracking_number`: Nomor resi wajib diisi untuk channel tertentu namun belum disertakan.
+
+##### Kode Error TikTok (`Ship Package`):
+- `36009001`: `package_id` tidak valid atau paket tidak ditemukan.
+- `36009002`: Status paket tidak valid untuk dikirimkan (bukan `AWAITING_COLLECTION` atau belum dipacking).
+- `36009003`: `handover_method` wajib diisi jika paket dikirimkan menggunakan jasa logistik platform.
+- `36009004`: `pickup_slot` tidak valid atau di luar jam operasional penjemputan jasa kirim.
+- `36009005`: Tracking number atau provider ID pengiriman mandiri (`self_shipment`) tidak valid.
 
 ---
 
@@ -2042,6 +2960,7 @@ Gateway menangani **dua format error Shopee** sekaligus:
 | `GET /products`   | `page_token`   | string   | ❌       | —       | Cursor (TikTok) — isi `next_page_token` dari response sebelumnya (alias: `next_page_token`) |
 | `GET /products`   | `keyword`      | string   | ❌       | —       | Max 200 karakter                        |
 | `GET /products`   | `status`       | string   | ❌       | —       | `"ACTIVE"`, `"INACTIVE"`, `"DELETED"`  |
+| `GET /products`   | `listing_platforms` | string | ❌   | —       | TikTok only — string dipisah koma (`TIKTOK_SHOP,TOKOPEDIA`) atau POST body JSON array |
 | `GET /products`   | `translate`    | boolean  | ❌       | `true`  | `false` → response enriched RAW tanpa standarisasi; `true` (default) → terstandarisasi |
 | `GET /products/{id}` | `product_id` | string | ✅ (path) | —     | ID produk di marketplace                |
 | `GET /order`   | `ids`         | string   | ❌       | —       | Order IDs dipisah koma (max 50) — jika diisi → detail mode   |
@@ -2050,6 +2969,8 @@ Gateway menangani **dua format error Shopee** sekaligus:
 | `GET /order`   | `page_size`   | integer  | ❌       | `20`    | 1 – 100 (di-clamp otomatis)              |
 | `GET /order`   | `page_token`  | string   | ❌       | —       | Cursor (TikTok: `next_page_token` · Shopee: `next_cursor`) — alias `next_page_token` |
 | `GET /order`   | `translate`   | boolean  | ❌       | `true`  | `false` → raw (merged) response marketplace |
+| `GET /order`   | `product_id`  | string   | ❌       | —       | **Filter ter-target** reserved stock per produk (`translate=true` saja) — hasil diberi blok `filtered_by` |
+| `GET /order`   | `variant_id`  | string   | ❌       | —       | Filter per variant (`model_id` / `sku_id`), boleh bersama `product_id` |
 
 ### 9.2 Mapping Parameter per Marketplace
 
@@ -2062,6 +2983,7 @@ Gateway menangani **dua format error Shopee** sekaligus:
 | `page_size`       | `page_size`         | `page_size`               |
 | `keyword`         | `search_keyword`    | `seller_skus` (body)      |
 | `status`          | `item_status` = `"NORMAL"` (jika ACTIVE) | `status` = `"ACTIVATE"` (body) |
+| `listing_platforms` | — (diabaikan)     | `listing_platforms` (body, array) |
 | — (default)       | `item_status` = `"NORMAL"` (selalu dikirim) | — |
 
 > ⚠️ **Penting:** Shopee menggunakan `"NORMAL"` untuk status produk aktif (bukan `"ACTIVE"`).
@@ -2246,6 +3168,17 @@ Response fan-out menggabungkan produk dari semua marketplace dalam satu array `p
 | `Shopee error '0': ...`           | Error check bentrok dengan format sukses (number 0) | Fixed — gateway handle dual format error   |
 | `bad argument #2 to 'format' (number expected, got string)` | `%d` pada string error | Fixed — gateway deteksi format otomatis     |
 
+#### Lazada Common Errors
+
+| Error                              | Penyebab                                     | Solusi                                      |
+|------------------------------------|----------------------------------------------|---------------------------------------------|
+| `InvalidAppKey` (HTTP 200)         | `global.lazada.app_key` salah                | Isi `app_key` Lazada yang benar di `credentials.json` |
+| `InvalidSignature`                 | Signature salah / timestamp bukan ms         | Pastikan `sign_method=sha256` & `timestamp` milliseconds — ditangani adapter; jangan mengubah manual |
+| `MISSING_SITE` (400)               | `site` tidak dikirim saat update-stock       | Kirim `"site": "SG"` di body atau `?site=SG` |
+| `UNAUTHORIZED` + `InvalidAccessToken` | Access token expired                     | Gateway auto-refresh; jika gagal, `POST /auth/token` ulang |
+| `PARTIAL_FAILURE` + `failed_sku`   | SKU ID tidak ada di item Lazada              | Pakai `skus[].SkuId` dari `GET /products` (bukan SellerSku) |
+| `ENDPOINT_NOT_SUPPORTED`           | Memanggil update-status/create/ship Lazada   | Lihat [12.7 Keterbatasan](#127-keterbatasan) |
+
 #### TikTok Common Errors
 
 | Error                              | Penyebab                                     | Solusi                                      |
@@ -2316,6 +3249,149 @@ curl -s -X POST http://localhost:9080/auth/refresh \
 | 16 | **Pagination produk TikTok** tidak bisa lanjut ke halaman 2 — `page_token` dari response tidak bisa diteruskan | `GET /products` kini menerima query `page_token` / `next_page_token` dan diteruskan ke TikTok sebagai `page_token` | `request-transformer.lua` |
 | 17 | **`page_size` order TikTok** tidak di-clamp (nilai invalid diteruskan mentah ke API) | Clamp ke rentang valid [1,100] dengan `math.floor`, sama seperti Shopee | `parameter-mapping.lua` |
 | 18 | **Response order terunifikasi** kehilangan metadata pagination (`has_next` & `next_page_token` selalu kosong) | Normalizer order kini membawa `total_count` / `next_page_token` / `has_more`; config orders diberi blok `pagination`; standardizer mendukung flag `has_next` eksplisit | `response-mapping.lua` + `standardization-config.json` + `standardizer.lua` |
+| 19 | **Fallback path di config** harus ditulis sebagai field terpisah (`_alt` / `_fallback`) — verbose dan sulit dibaca | `source` (dan path pagination / `product_root` / `skus.source`) kini mendukung sintaks `||`: kandidat dinilai berurutan, nilai non-nil pertama yang dipakai. Contoh: `"model_sku \|\| item_sku \|\| id"`. Bisa digabung dengan notasi koleksi `[]`; transform tetap dijalankan sekali pada nilai akhir. Format lama `_alt`/`_fallback` tetap didukung | `standardizer.lua` + `standardization-config.json` |
+
+---
+
+---
+
+## 12. Lazada Integration
+
+Lazada didukung lewat adapter `apisix/adapters/lazada-adapter.lua`, mapping
+endpoint di `apisix/mappings/endpoint-mapping.lua`, dan normalisasi order di
+`apisix/mappings/response-mapping.lua`. Tidak ada kode gateway baru yang perlu
+ditulis untuk menambah field: semua pemetaan produk/status berbasis config
+(`standardization-config.json` + `content-mapping.json`).
+
+### 12.1 Ringkasan Endpoint Lazada
+
+| Unified endpoint | Method | Lazada API | Path |
+|------------------|--------|------------|------|
+| `POST /auth/token` | GET | GenerateAccessToken | `/auth/token/create` (host `auth.lazada.com/rest`) |
+| `POST /auth/refresh` | GET | RefreshAccessToken | `/auth/token/refresh` (host `auth.lazada.com/rest`) |
+| `GET /products` | GET | GetProducts | `/products/get` |
+| `GET /products/{id}` | GET | GetProductItem | `/product/item/get?item_id=...` |
+| `POST /update-stock/{id}` | POST | EditChoiceSkuStock | `/choice/stock/edit` |
+| `GET /order` (list) | GET | GetOrders | `/orders/get` |
+| `GET /order?ids=...` | GET | GetOrderItems | `/order/items/get?order_id=...` (1 call per ID) |
+
+Contoh:
+
+```bash
+# Products (list + detail)
+curl "http://localhost:9080/products?marketplace=lazada&shop_uuid=my-lazada-shop&page=1&page_size=50"
+curl "http://localhost:9080/products/123456789?marketplace=lazada&shop_uuid=my-lazada-shop"
+
+# Orders
+curl "http://localhost:9080/order?marketplace=lazada&shop_uuid=my-lazada-shop"
+curl "http://localhost:9080/order?marketplace=lazada&shop_uuid=my-lazada-shop&ids=1001,1002"
+
+# Auth status
+curl -X POST http://localhost:9080/auth/status \
+  -H "Content-Type: application/json" \
+  -d '{"marketplace":"lazada","shop_uuid":"my-lazada-shop"}'
+```
+
+**Mapping parameter utama:**
+
+| Unified | Lazada |
+|---------|--------|
+| `page`, `page_size` | `offset` = `(page-1)*limit`, `limit` (max 50 products / 100 orders) |
+| `status` (produk) | `filter` = `live` / `inactive` / `deleted` / `pending` / `rejected` / `sold-out` |
+| `status` (order) | `status` = `unpaid` / `pending` / `ready_to_ship` / ... (huruf kecil) |
+| `ids` | `order_id` (satu per call) |
+| — | `options=1` otomatis agar GetProducts menyertakan `ReservedStock` |
+
+### 12.2 Signature & Timestamp Lazada
+
+- `sign_method` = **sha256**
+- `timestamp` = **milliseconds** (bukan detik)
+- `sign` = **UPPERCASE** hex HMAC-SHA256(`app_secret`, `api_path` + `sorted(key+value)`)
+- **GET**: semua parameter (system + bisnis) ada di query dan ikut ditandatangani.
+- **POST**: hanya system params (`app_key`, `timestamp`, `access_token`, `sign_method`)
+  yang ditandatangani; parameter bisnis dikirim di JSON body.
+
+System params Lazada: `app_key`, `timestamp`, `access_token`, `sign_method`, `sign`.
+
+### 12.3 Update Stock Lazada (EditChoiceSkuStock)
+
+```bash
+curl -X POST "http://localhost:9080/update-stock/123456789?marketplace=lazada&shop_uuid=my-lazada-shop" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "skus": [ { "id": "987654321", "stock": 25 } ],
+    "site": "SG"
+  }'
+```
+
+- `site` **wajib** (SG/MY/ID/PH/TH/VN) — boleh di body atau query `?site=SG`.
+  Tanpa `site`, gateway membalas `400 MISSING_SITE` sebelum memanggil Lazada.
+- `skus[].id` = **SkuId** Lazada (dari `skus[].SkuId` pada `GET /products`).
+- Body yang dikirim ke Lazada:
+  ```json
+  { "item_id": 123456789, "site": "SG", "sku_edit_stock": { "987654321": 25 } }
+  ```
+- API ini **tidak mendukung multi-warehouse** — bila `inventory[]` dikirim,
+  gateway memakai entry pertama.
+- `failed_sku` tidak kosong → gateway membalas `400 PARTIAL_FAILURE` (strict).
+
+### 12.4 Orders Lazada
+
+- **List mode** (`GET /order`): `GetOrders` + enrich `GetOrderItems` per order
+  (GetOrders tidak menyertakan line item), lalu agregasi `reserved_stock`.
+  Status default yang diambil: `unpaid`, `ready_to_ship`.
+- **Detail mode** (`GET /order?ids=...`): `GetOrderItems` dipanggil **satu kali per
+  order ID** (Lazada tidak menerima multi-ID di endpoint ini), hasilnya digabung.
+- Status Lazada yang dihitung sebagai reserved: `UNPAID`, `PENDING`,
+  `READY_TO_SHIP`, `TOPACK`, `TOSHIP` (lihat `RESERVED_ORDER_STATUSES.lazada`).
+
+### 12.5 Konfigurasi (Configurable)
+
+Sama seperti Shopee/TikTok, Lazada **tidak hardcoded**:
+
+| File | Bagian | Fungsi |
+|------|--------|--------|
+| `credentials/credentials.json` | `global.lazada` | `app_key`, `app_secret`, `base_url` per region |
+| `apisix/content-mapping.json` | `fields.status.lazada`, `fields.product_id.lazada` | status native Lazada ↔ status internal |
+| `apisix/standardization-config.json` | `products.lazada`, `orders.lazada` | field & SKU mapping + validasi wajib |
+| `apisix/update-config.json` | `endpoints.update_stock.lazada` | whitelist field body (`skus`, `site`) + `enabled` |
+| `apisix/mappings/endpoint-mapping.lua` | grup `*.lazada` | path & method API Lazada |
+| `apisix/mappings/parameter-mapping.lua` | `lazada_*` | transform parameter + body builder |
+
+Contoh menambah field Lazada: tambahkan path sumbernya di
+`standardization-config.json` → `products.lazada.fields`, lalu restart
+`docker compose restart apisix`. Untuk status baru, tambahkan di
+`content-mapping.json` → `fields.status.lazada`.
+
+### 12.6 Webhook Lazada (Push Mechanism)
+
+Route **25** (`POST /webhook/lazada`, plugin `webhook-receiver`) menerima push
+dari Lazada Push Mechanism. Ringkasnya (detail lengkap di §5.4a):
+
+- Signature: `Authorization = HEX(HMAC-SHA256(app_secret, app_key .. raw_body))`.
+- `message_type`: `0` order (forward/reverse), `3` product created, `4` product
+  edited, `5` product deleted; lainnya → `event_<n>`.
+- `event_type`: `order_update`, `reverse_order_update`, `product_created`,
+  `product_updated`, `product_deleted`.
+- Signal code untuk filter `signal_codes` = `message_type`
+  (`webhook-config.json` → `settings.signal_code_paths.lazada`).
+- Shop id di payload bernama `seller_id` (bukan `shop_id`); payload disimpan di
+  `webhook-data/lazada/`.
+- Balasan HTTP 200 (`OK`) segera; Lazada retry 12x / 30 menit bila gagal.
+- Callback wajib HTTPS (sertifikat OV/EV).
+
+### 12.7 Keterbatasan
+
+| Endpoint | Status di gateway | Alasan |
+|----------|-------------------|--------|
+| `POST /update-status` | `400 ENDPOINT_NOT_SUPPORTED` | Belum ada padanan yang didokumentasikan di PDF Lazada |
+| `POST /products` | `400 ENDPOINT_NOT_SUPPORTED` | Lazada memakai `GET /products/get` |
+| `POST /products/create` | `400 ENDPOINT_NOT_SUPPORTED` | CreateProduct Lazada belum diimplementasikan |
+| `POST /ship-order` | `400 ENDPOINT_NOT_SUPPORTED` | Shipment Lazada belum diimplementasikan |
+| `marketplace=all` untuk mutasi | `400 INVALID_MARKETPLACE` | Mutasi bersifat per-shop (sama seperti marketplace lain) |
+
+Untuk fan-out baca (`GET /products?marketplace=all`), tambahkan
+`shop_uuid_lazada=<uuid>` di samping `shop_uuid_shopee` / `shop_uuid_tiktok`.
 
 ---
 

@@ -51,6 +51,8 @@ services:
       - ./apisix/standardization-config.json:/usr/local/apisix/custom/standardization-config.json:rw
       - ./apisix/content-mapping.json:/usr/local/apisix/custom/content-mapping.json:rw
       - ./apisix/update-config.json:/usr/local/apisix/custom/update-config.json:rw
+      # Konfigurasi webhook forwarding (URL target, filter signal code, payload)
+      - ./apisix/webhook-config.json:/usr/local/apisix/custom/webhook-config.json:rw
       - ./apisix/utils:/usr/local/apisix/custom/utils:ro
       - ./apisix/credentials:/usr/local/apisix/custom/credentials:ro
       - ./apisix/mappings:/usr/local/apisix/custom/mappings:ro
@@ -72,8 +74,11 @@ services:
       - TIKTOK_APP_KEY=test_app_key
       - TIKTOK_APP_SECRET=test_app_secret_for_smoke_test
       - TIKTOK_BASE_URL=https://open-api.tiktokglobalshop.com
-    env_file:
-      - .env
+      # Lazada: nilai sebenarnya dibaca dari credentials/credentials.json
+      # (global.lazada). Env ini hanya untuk parity/debug.
+      - LAZADA_APP_KEY=test_lazada_app_key
+      - LAZADA_APP_SECRET=test_lazada_app_secret
+      - LAZADA_BASE_URL=https://api.lazada.sg/rest
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:9180/apisix/admin/routes", "-H", "X-API-KEY: edd1c9f034335f136f87ad84b625c8f1"]
       interval: 5s

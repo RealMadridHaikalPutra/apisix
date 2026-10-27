@@ -1,6 +1,6 @@
 # Unified Marketplace Gateway
 
-Middleware berbasis **Apache APISIX** yang menyediakan **satu API terpadu** untuk mengakses berbagai marketplace (Shopee dan TikTok). Gateway ini menangani seluruh kompleksitas autentikasi, signature HMAC-SHA256, token lifecycle, parameter mapping, dan normalisasi response.
+Middleware berbasis **Apache APISIX** yang menyediakan **satu API terpadu** untuk mengakses berbagai marketplace (Shopee, TikTok, dan Lazada). Gateway ini menangani seluruh kompleksitas autentikasi, signature HMAC-SHA256, token lifecycle, parameter mapping, dan normalisasi response.
 
 **Base URL:** `http://localhost:9080`
 
@@ -11,7 +11,7 @@ Middleware berbasis **Apache APISIX** yang menyediakan **satu API terpadu** untu
 | Fitur | Status | Deskripsi |
 |-------|:------:|-----------|
 | 🔐 **Auto Token Lifecycle** | ✅ | Auto-refresh access token expired, persist ke `credentials.json` |
-| 🔑 **HMAC-SHA256 Signatures** | ✅ | Shopee & TikTok signature generation |
+| 🔑 **HMAC-SHA256 Signatures** | ✅ | Shopee, TikTok & Lazada signature generation |
 | 🔄 **Multi-Format Stock Update** | ✅ | Format A (native multi-warehouse) & Format B (legacy flat) |
 | 📦 **Create Product** | ✅ | Unified ke Shopee & TikTok |
 | 🔁 **Update Status** | ✅ | ACTIVE/INACTIVE (Shopee: single, TikTok: batch max 20) |
@@ -20,6 +20,7 @@ Middleware berbasis **Apache APISIX** yang menyediakan **satu API terpadu** untu
 | 📋 **Auto Inventory Enrichment** | ✅ (TikTok) | Stock per-warehouse dari Inventory Search API |
 | 📄 **Pagination Lengkap** | ✅ | Page/offset (Shopee) & cursor/`page_token` (TikTok) + metadata `pagination` (page, page_size, total, has_next, next_page_token) di semua response list |
 | 📡 **Webhook Receiver** | ✅ | Terima real-time stock update dari Shopee & TikTok |
+| 🛒 **Lazada** | ✅ | Products, Product Detail, Update Stock (EditChoiceSkuStock), Orders & Order Items |
 | 🔄 **Auto-Retry on Auth Error** | ✅ | Force-refresh token + retry jika marketplace return 401 |
 | 📝 **Structured Logging** | ✅ | JSON logging dengan request_id untuk tracing |
 | 🎛 **Config Center (Web UI)** | ✅ | Route `/config` terdaftar — UI masih placeholder. Config saat ini diubah langsung dari file lalu restart. |
@@ -89,7 +90,7 @@ Middleware berbasis **Apache APISIX** yang menyediakan **satu API terpadu** untu
 |--------|:-----:|:--------:|--------|
 | **token-manager** | rewrite | 2100 | Menangani endpoint `/auth/*` (get/refresh/status token) |
 | **credential-loader** | rewrite | 2000 | Load credentials shop + auto-refresh jika expired |
-| **marketplace-router** | rewrite | 1990 | Menentukan adapter marketplace (shopee/tiktok/all) |
+| **marketplace-router** | rewrite | 1990 | Menentukan adapter marketplace (shopee/tiktok/lazada/all) |
 | **request-transformer** | access | 1980 | Transformasi unified → marketplace request + normalisasi inline |
 | **webhook-receiver** | rewrite | 1950 | Menerima webhook dari marketplace (stock update) |
 | **webhook-registrar** | rewrite | 1940 | Registrasi/manajemen webhook |
@@ -103,7 +104,7 @@ Middleware berbasis **Apache APISIX** yang menyediakan **satu API terpadu** untu
 ### 1. Prasyarat
 
 - Docker & Docker Compose
-- Kredensial API marketplace (Shopee Partner ID/Key, TikTok App Key/Secret)
+- Kredensial API marketplace (Shopee Partner ID/Key, TikTok App Key/Secret, Lazada App Key/Secret)
 
 ### 2. Konfigurasi Kredensial
 
@@ -182,6 +183,7 @@ Saat `docker compose up`, service **bootstrap** (`bootstrap/init.sh`) secara **o
 | 1 | Shopee | `partner.shopeemobile.com` | 443 |
 | 2 | TikTok Products | `open-api.tiktokglobalshop.com` | 443 |
 | 3 | TikTok Auth | `auth.tiktok-shops.com` | 443 |
+| 4 | Lazada | `api.lazada.sg` (default; region lain via `global.lazada.base_url`) | 443 |
 
 #### Routes yang Teregister (17 routes)
 
@@ -242,10 +244,114 @@ curl "http://localhost:9080/products?marketplace=tiktok&shop_uuid=74947094296668
 | `POST` | `/products/create` | Shopee, TikTok | Buat produk baru |
 | `POST` | `/update-stock/{product_id}` | Shopee, TikTok | Update stok SKU |
 | `POST` | `/update-status/{product_id}` | Shopee, TikTok | Update status (ACTIVE/INACTIVE) |
+
+### ⚠️ Update Stock: Produk Tanpa Varian vs Bervarian
+
+| Kondisi Produk | Marketplace | Nilai `skus[].id` yang Benar |
+|----------------|-------------|------------------------------|
+| Tanpa varian | **Shopee** | `"0"` (konvensi `model_id = 0` = default model) |
+| Tanpa varian | **TikTok** | **SKU ID asli dari TikTok** — TikTok selalu punya minimal 1 SKU per produk; `"0"` akan ditolak (`12052556`) |
+| Bervarian | Shopee | `model_id` varian (dari `variations[].id` di `GET /products`) |
+| Bervarian | TikTok | SKU ID varian (dari `variations[].id` di `GET /products`) |
+
+Dua format body tetap didukung untuk keduanya (native multi-warehouse `inventory[]`, atau legacy flat `stock` + `warehouse_id`) — lihat [DOCUMENTATION.md §4.1](./DOCUMENTATION.md).
+
+### 🛡️ Strict Error Handling
+
+TIDAK ADA error yang lolos sebagai HTTP 200. Response 200 dari gateway dijamin bersih:
+
+- **Transport error / HTTP 4xx-5xx upstream** → HTTP error terpadu (400/401/403/404/429/502) dengan `original_code` + pesan asli marketplace
+- **Business error di HTTP 200** — Shopee `failure_list` tidak kosong / error flag, TikTok `code != 0` → **HTTP 400 `PARTIAL_FAILURE`** dengan detail `failures[]` per item
+- **Body kosong / non-JSON dari upstream** → HTTP 502 `UPSTREAM_ERROR`
+
+Contoh — Shopee menolak model ID (`model ID not exist in sku`) kini dibalas:
+
+```json
+{
+  "error": {
+    "code": "PARTIAL_FAILURE",
+    "message": "marketplace rejected 1 item(s) — failure_list: 19560950944: model ID not exist in sku",
+    "failures": [{ "model_id": 19560950944, "failed_reason": "model ID not exist in sku" }]
+  }
+}
+```
+
+Berlaku untuk semua endpoint mutasi (update-stock, update-status, create-product) dan endpoint baca (product detail, inventory search).
+
+---
+
 | `POST` | `/webhook/shopee` | Shopee | Terima webhook |
 | `POST` | `/webhook/tiktok` | TikTok | Terima webhook |
-| `GET,POST` | `/webhook/register` | — | Daftar/cek alamat backend untuk forward webhook |
+| `GET,POST` | `/webhook/register` | — | Daftar/kelola target forward webhook (URL, filter signal code, method, payload) |
 | `GET,PUT` | `/config*` | — | Config Center UI — kelola config dari browser |
+
+---
+
+## 🔔 Webhook Forwarding (Configurable)
+
+Setiap signal dari marketplace `/webhook/shopee` & `/webhook/tiktok` diteruskan ke
+URL backend yang terdaftar. Semua pengaturannya ada dalam **satu file JSON yang
+bisa diedit manual tanpa restart**:
+
+```
+apisix/webhook-config.json   →  /usr/local/apisix/custom/webhook-config.json (container)
+```
+
+Yang bisa diatur per target: URL (placeholder `{{data.item_id}}` didukung),
+`method`, `headers`, `query`, `conditions` (eq/gt/contains/regex/…),
+bentuk `payload` (wrapped/raw/custom), `body` JSON dinamis, retry, dan
+**filter `signal_codes`** — jadi hanya signal code tertentu (mis. Shopee
+`code=4`, TikTok `type=2`) yang di-forward. Bila beberapa target cocok, signal
+dikirim ke semuanya (asinkron).
+
+**Camunda:** set `"type": "camunda"` untuk **start process instance** dari
+signal marketplace — payload start-process dibangun otomatis (Camunda 7
+`/engine-rest` maupun Camunda 8 `/v2/process-instances`), lengkap dengan mapping
+variabel, business key, tenant, dan tipe variabel.
+
+```json
+{
+  "id": "camunda-stock",
+  "type": "camunda",
+  "marketplace": "all",
+  "signal_codes": [4, 2],
+  "camunda": {
+    "version": 7,
+    "base_url": "https://camunda-anda.com",
+    "process_definition_key": "stock-sync",
+    "business_key": "{{shop_id}}-{{data.item_id}}",
+    "variables": { "itemId": "data.item_id", "stock": "data.normal_stock" }
+  }
+}
+```
+
+```json
+{
+  "targets": [
+    {
+      "id": "stock-backend",
+      "marketplace": "all",
+      "signal_codes": [4, 2],
+      "method": "POST",
+      "url": "https://backend-anda.com/webhooks/stock",
+      "conditions": [{ "path": "data.normal_stock", "op": "gt", "value": 0 }],
+      "payload": { "mode": "raw" }
+    }
+  ]
+}
+```
+
+```bash
+# Daftarkan URL backend lewat API (tersimpan ke webhook-config.json)
+curl -X POST http://localhost:9080/webhook/register \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://backend-anda.com/webhooks/all", "signal_codes": [4, 2]}'
+
+# Lihat konfigurasi yang berlaku
+curl http://localhost:9080/webhook/register
+```
+
+📖 Detail lengkap: [DOCUMENTATION.md §5.5](./DOCUMENTATION.md)
 
 ---
 

@@ -103,6 +103,32 @@ local function load_credentials_file()
         }
     end
 
+    -- Validate Lazada global credentials
+    -- Lazada memakai app_key + app_secret dan host API PER REGION, jadi
+    -- base_url wajib diisi sesuai negara toko (lihat credentials.json).
+    local lazada = global.lazada
+    if lazada then
+        if not lazada.app_key then
+            _init_error = "credentials.json global.lazada missing 'app_key'"
+            return false
+        end
+        if not lazada.app_secret then
+            _init_error = "credentials.json global.lazada missing 'app_secret'"
+            return false
+        end
+        _global_credentials_cache.lazada = {
+            app_key    = lazada.app_key,
+            app_secret = lazada.app_secret,
+            -- Default: Singapore. Region lain:
+            --   https://api.lazada.com.my/rest   (Malaysia)
+            --   https://api.lazada.co.th/rest    (Thailand)
+            --   https://api.lazada.vn/rest       (Vietnam)
+            --   https://api.lazada.co.id/rest    (Indonesia)
+            --   https://api.lazada.com.ph/rest   (Philippines)
+            base_url   = lazada.base_url or "https://api.lazada.sg/rest",
+        }
+    end
+
     _init_ok = true
     return true
 end

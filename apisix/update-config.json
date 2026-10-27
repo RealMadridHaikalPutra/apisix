@@ -66,6 +66,15 @@
           "skus"
         ],
         "field_map": {}
+      },
+      "lazada": {
+        "_comment": "Lazada EditChoiceSkuStock (POST /choice/stock/edit). Yang bisa diubah: 'skus' (data stok) dan 'site' (kode negara: SG/MY/ID/PH/TH/VN, wajib). Ubah site default lewat query ?site=SG atau body {\"site\":\"SG\"}. Field lain ditolak (400 INVALID_FIELD).",
+        "enabled": true,
+        "updatable_fields": [
+          "skus",
+          "site"
+        ],
+        "field_map": {}
       }
     },
     "update_status": {
@@ -107,6 +116,199 @@
           "status"
         ],
         "field_map": {}
+      }
+    },
+    "ship_order": {
+      "_comment": "Endpoint PENGIRIMAN PESANAN / PAKET & REQUEST PICKUP (POST /ship-order, /request-pickup, /pickup). SEMUA mapping variabel ada di JSON ini: handover_aliases, infer_order, api (path native), dan request_map (root_fields + fields per handover_method). Ubah nama field/target native di sini tanpa mengedit Lua. BATCH: order_id / order_ids boleh ARRAY (atau string dipisah koma) → gateway SCAN GET order detail lebih dulu untuk ambil package native (TikTok package_id, Shopee package_number) lalu ship SEMUA paket; batas jumlah id per request di options.max_batch_size.",
+      "handover_aliases": {
+        "PICKUP": "PICKUP",
+        "PICK_UP": "PICKUP",
+        "PICK-UP": "PICKUP",
+        "DROP_OFF": "DROP_OFF",
+        "DROPOFF": "DROP_OFF",
+        "DROP-OFF": "DROP_OFF",
+        "NON_INTEGRATED": "NON_INTEGRATED",
+        "NONINTEGRATED": "NON_INTEGRATED",
+        "NON-INTEGRATED": "NON_INTEGRATED",
+        "SELF_SHIPMENT": "SELF_SHIPMENT",
+        "SELF_SHIPPED": "SELF_SHIPMENT",
+        "SELF_SHIP": "SELF_SHIPMENT"
+      },
+      "infer_order": ["PICKUP", "DROP_OFF", "NON_INTEGRATED", "SELF_SHIPMENT"],
+      "_request_map_comment": "Schema rule: target = dot-path field native tujuan; sources = daftar dot-path field standar sumber (prefix '@' membaca query/path params); value = nilai literal; type = string|integer|number|boolean; default = { from, option, op: add|subtract } untuk nilai turunan.",
+      "shopee": {
+        "_comment": "Shopee ship_order (POST /api/v2/logistics/ship_order). Field yang diizinkan untuk dikirim ke Shopee.",
+        "enabled": true,
+        "api": {
+          "path": "/api/v2/logistics/ship_order",
+          "method": "POST"
+        },
+        "request_map": {
+          "root_fields": [
+            {
+              "target": "order_sn",
+              "sources": ["order_id", "order_sn", "package_id", "@order_sn", "@order_id", "@product_id"],
+              "type": "string"
+            },
+            {
+              "target": "package_number",
+              "sources": ["package_number", "@package_number"],
+              "type": "string"
+            }
+          ],
+          "methods": {
+            "PICKUP": {
+              "infer_sources": ["pickup", "pickup_slot", "address_id", "pickup_time_id", "time_slot_id", "start_time", "end_time"],
+              "fields": [
+                { "target": "pickup.address_id", "sources": ["pickup.address_id", "address_id"], "type": "integer" },
+                { "target": "pickup.pickup_time_id", "sources": ["pickup.time_slot_id", "pickup.pickup_time_id", "time_slot_id", "pickup_time_id", "pickup.start_time", "pickup_slot.start_time", "start_time"], "type": "string" },
+                { "target": "pickup.tracking_number", "sources": ["pickup.tracking_number", "tracking_number"], "type": "string" }
+              ]
+            },
+            "DROP_OFF": {
+              "infer_sources": ["dropoff", "branch_id", "sender_real_name", "slug"],
+              "fields": [
+                { "target": "dropoff.branch_id", "sources": ["dropoff.branch_id", "branch_id"], "type": "integer" },
+                { "target": "dropoff.sender_real_name", "sources": ["dropoff.sender_real_name", "sender_real_name"], "type": "string" },
+                { "target": "dropoff.tracking_number", "sources": ["dropoff.tracking_number", "tracking_number"], "type": "string" },
+                { "target": "dropoff.slug", "sources": ["dropoff.slug", "slug"], "type": "string" }
+              ]
+            },
+            "NON_INTEGRATED": {
+              "infer_sources": ["non_integrated"],
+              "fields": [
+                { "target": "non_integrated.tracking_number", "sources": ["non_integrated.tracking_number", "self_shipment.tracking_number", "tracking_number"], "type": "string" }
+              ]
+            },
+            "SELF_SHIPMENT": {
+              "infer_sources": ["self_shipment"],
+              "fields": [
+                { "target": "non_integrated.tracking_number", "sources": ["self_shipment.tracking_number", "non_integrated.tracking_number", "tracking_number"], "type": "string" }
+              ]
+            }
+          },
+          "excluded_root_fields": [
+            "order_sn", "order_id", "order_ids", "package_id", "package_number",
+            "pickup", "dropoff", "non_integrated",
+            "handover_method", "address_id", "pickup_time_id", "time_slot_id",
+            "tracking_number", "branch_id", "sender_real_name",
+            "slug", "start_time", "end_time", "pickup_slot",
+            "self_shipment", "shipping_provider_id"
+          ]
+        },
+        "updatable_fields": [
+          "order_sn",
+          "order_id",
+          "order_ids",
+          "package_id",
+          "package_number",
+          "pickup",
+          "pickup_slot",
+          "dropoff",
+          "non_integrated",
+          "self_shipment",
+          "handover_method",
+          "address_id",
+          "pickup_time_id",
+          "time_slot_id",
+          "start_time",
+          "end_time",
+          "tracking_number",
+          "branch_id",
+          "sender_real_name",
+          "slug",
+          "shipping_provider_id"
+        ],
+        "field_map": {},
+        "options": {
+          "_comment": "SELF_SHIPMENT/NON_INTEGRATED diterjemahkan ke Shopee non_integrated (tracking_number wajib). max_batch_size = batas jumlah order id per request (0 = tanpa batas).",
+          "default_pickup_duration_seconds": 7200,
+          "max_batch_size": 50
+        }
+      },
+      "tiktok": {
+        "_comment": "TikTok ship package (POST /fulfillment/202309/packages/{package_id}/ship). Field yang diizinkan untuk dikirim ke TikTok.",
+        "enabled": true,
+        "api": {
+          "path": "/fulfillment/202309/packages/{package_id}/ship",
+          "method": "POST"
+        },
+        "request_map": {
+          "root_fields": [],
+          "methods": {
+            "PICKUP": {
+              "infer_sources": ["pickup", "pickup_slot", "address_id", "pickup_time_id", "time_slot_id", "start_time", "end_time"],
+              "fields": [
+                { "target": "handover_method", "value": "PICKUP" },
+                {
+                  "target": "pickup_slot.start_time",
+                  "sources": ["pickup_slot.start_time", "pickup.start_time", "start_time", "pickup.pickup_time_id", "pickup_time_id"],
+                  "type": "integer",
+                  "default": { "from": "pickup_slot.end_time", "option": "default_pickup_duration_seconds", "op": "subtract" }
+                },
+                {
+                  "target": "pickup_slot.end_time",
+                  "sources": ["pickup_slot.end_time", "pickup.end_time", "end_time"],
+                  "type": "integer",
+                  "default": { "from": "pickup_slot.start_time", "option": "default_pickup_duration_seconds", "op": "add" }
+                }
+              ]
+            },
+            "DROP_OFF": {
+              "infer_sources": ["dropoff", "branch_id", "sender_real_name", "slug"],
+              "fields": [
+                { "target": "handover_method", "value": "DROP_OFF" }
+              ]
+            },
+            "NON_INTEGRATED": {
+              "infer_sources": ["non_integrated"],
+              "fields": [
+                { "target": "self_shipment.tracking_number", "sources": ["self_shipment.tracking_number", "non_integrated.tracking_number", "tracking_number"], "type": "string" },
+                { "target": "self_shipment.shipping_provider_id", "sources": ["self_shipment.shipping_provider_id", "shipping_provider_id"], "type": "string" }
+              ]
+            },
+            "SELF_SHIPMENT": {
+              "infer_sources": ["self_shipment"],
+              "fields": [
+                { "target": "self_shipment.tracking_number", "sources": ["self_shipment.tracking_number", "non_integrated.tracking_number", "tracking_number"], "type": "string" },
+                { "target": "self_shipment.shipping_provider_id", "sources": ["self_shipment.shipping_provider_id", "shipping_provider_id"], "type": "string" }
+              ]
+            }
+          },
+          "excluded_root_fields": [
+            "order_sn", "order_id", "order_ids", "package_id", "package_number",
+            "pickup", "dropoff", "non_integrated",
+            "handover_method", "address_id", "pickup_time_id", "time_slot_id",
+            "tracking_number", "branch_id", "sender_real_name",
+            "slug", "start_time", "end_time", "pickup_slot",
+            "self_shipment", "shipping_provider_id"
+          ]
+        },
+        "updatable_fields": [
+          "order_sn",
+          "order_id",
+          "order_ids",
+          "package_id",
+          "package_number",
+          "handover_method",
+          "pickup",
+          "pickup_slot",
+          "self_shipment",
+          "non_integrated",
+          "start_time",
+          "end_time",
+          "address_id",
+          "pickup_time_id",
+          "time_slot_id",
+          "tracking_number",
+          "shipping_provider_id"
+        ],
+        "field_map": {},
+        "options": {
+          "_comment": "Dipakai saat PICKUP hanya mengirim start_time (end_time otomatis = start_time + nilai ini). max_batch_size = batas jumlah order id per request (0 = tanpa batas).",
+          "default_pickup_duration_seconds": 7200,
+          "max_batch_size": 50
+        }
       }
     }
   }

@@ -121,10 +121,10 @@ end
 
 local function validate_params(data)
     if not data.marketplace then
-        return nil, "'marketplace' is required (shopee or tiktok)"
+        return nil, "'marketplace' is required (shopee, tiktok, or lazada)"
     end
     local mp = data.marketplace:lower()
-    if mp ~= "shopee" and mp ~= "tiktok" then
+    if mp ~= "shopee" and mp ~= "tiktok" and mp ~= "lazada" then
         return nil, "unsupported marketplace: " .. data.marketplace
     end
     if not data.shop_uuid then

@@ -1,0 +1,104 @@
+{
+  "_comment": "KONFIGURASI WEBHOOK FORWARDING — semua pengaturan forward webhook ada di file ini.\n\nALUR: marketplace (Shopee/TikTok) kirim signal ke /webhook/shopee atau /webhook/tiktok → gateway mem-forward ke URL yang terdaftar di sini (HTTP biasa ATAU start process Camunda).\n\nCARA PAKAI (untuk user awam):\n1. Mau menambah tujuan forward? Salin satu objek di dalam \"targets\", ganti \"id\" dan \"url\".\n2. Mau forward HANYA signal code tertentu (tidak semua signal di-forward)? Tulis daftarnya di \"signal_codes\", contoh: [4] (Shopee stock update) atau [2] (TikTok stock update). Kosongkan/`\"all\"` = semua signal.\n3. Mau filter lebih detail (mis. hanya jika stok > 0)? Tambahkan aturan di \"conditions\".\n4. Mau ubah bentuk payload, method, header? Atur di blok \"payload\", \"body\", \"method\", \"headers\" target tersebut (lihat panduan di bawah).\n5. Mau START PROCESS CAMUNDA dari signal ini? Set \"type\": \"camunda\" + isi blok \"camunda\" (lihat CONTOH 4 & 5).\n6. Simpan file → langsung berlaku, TANPA restart container.\n\nPAYLOAD DINAMIS:\n- Blok \"payload\" (mode wrapped/raw/custom) untuk bentuk standar. Default diambil dari settings.payload_mode = \"raw\" → body asli marketplace diteruskan apa adanya.\n  Pakai \"wrapped\" HANYA bila backend sengaja membaca metadata { marketplace, event_type, payload } dan tidak mem-parsing payload marketplace langsung.\n- Blok \"body\": body JSON apa pun yang boleh memakai placeholder {{path.payload}} — ini MENIMPA \"payload\". Contoh: {\"variables\": {\"itemId\": \"{{data.item_id}}\"}}.\n- Blok \"camunda\": payload start-process dibangun otomatis (v7 & v8) dari mapping variabel.\n\nBoleh juga mendaftar URL lewat API: POST /webhook/register (hasilnya disimpan ke bagian \"registrations\" di file ini). File ini boleh diedit manual; API akan menulis ulang file dalam format rapi.\n\nSATU signal per request. Semua \"targets\" + \"registrations\" yang COCOK akan menerima forward (bisa banyak URL sekaligus).",
+  "version": "1.0.0",
+  "settings": {
+    "_comment": "Pengaturan umum. \"enabled\": false = MATIKAN semua forward. \"max_attempts\" = jumlah percobaan kirim PER ITEM (3 = retry 2x dengan jeda retry_delay_ms sebelum masuk outbox). \"payload_mode\" = bentuk payload default untuk SEMUA target (termasuk yang didaftarkan lewat POST /webhook/register): \"raw\" = body ASLI marketplace diteruskan apa adanya (shopee \"code\", tiktok \"type\", plus shop_id, timestamp, data.*), \"wrapped\" = dibungkus { marketplace, event_type, payload } untuk backend yang membaca metadata.",
+    "enabled": true,
+    "timeout_ms": 10000,
+    "max_attempts": 3,
+    "retry_delay_ms": 1000,
+    "default_method": "POST",
+    "payload_mode": "raw",
+    "signal_code_paths": {
+      "_comment": "Lokasi field kode signal di dalam payload marketplace. Dipakai otomatis untuk filter signal_codes bila kode tidak dikirim eksplisit.",
+      "shopee": "code",
+      "tiktok": "type",
+      "lazada": "message_type"
+    },
+    "queue": {
+      "_comment": "ANTREAN FIFO per objek (utils/webhook-queue.lua). Update untuk shop+entity yang SAMA (mis. stok item / status order) dikirim BERURUTAN; objek beda tetap paralel. Butuh lua_shared_dict webhook_queue di config.yaml — tanpa itu degradasi ke kirim langsung (tanpa jaminan urutan). \"item_ttl_seconds\" = umur item di antrean. \"outbox_*\" = forward gagal disimpan ke /webhook-data/outbox/ lalu dikirim ulang oleh drainer periodik (tahan restart); setelah outbox_max_attempts → /webhook-data/outbox/failed/ (replay manual — payload asli juga tetap ada di /webhook-data/).",
+      "enabled": true,
+      "item_ttl_seconds": 3600,
+      "lock_timeout_seconds": 30,
+      "lock_exptime_seconds": 600,
+      "lock_max_batch": 10,
+      "outbox_enabled": true,
+      "outbox_dir": "/webhook-data/outbox",
+      "outbox_interval_seconds": 15,
+      "outbox_backoff_seconds": 30,
+      "outbox_max_attempts": 10,
+      "outbox_stale_claim": 600,
+      "outbox_max_files": 5000
+    },
+    "dedup": {
+      "_comment": "ANTI DUPLIKAT: retry marketplace membawa body byte-identik (termasuk timestamp event) → hash yang sama dalam TTL dianggap duplikat dan TIDAK diteruskan ke backend (balasan ke marketplace tetap sukses). Event baru dengan timestamp berbeda TIDAK terdampak. Challenge TikTok dijawab SEBELUM dedup sehingga verifikasi webhook tetap aman.",
+      "enabled": true,
+      "ttl_seconds": 600
+    },
+    "rate_limit": {
+      "_comment": "RATE LIMIT per marketplace, jendela tetap 1 detik. Melebihi per_second → ditolak 429 + header Retry-After (marketplace akan retry nanti). per_second=0 MENONAKTIFKAN. Fail-open: bila shared dict bermasalah, request tetap diproses. Dijalankan di dalam webhook-receiver (fase rewrite) karena plugin limit-req bawaan APISIX berjalan di fase access yang tidak pernah tercapai route ini.",
+      "enabled": true,
+      "per_second": 100,
+      "reject_code": 429
+    },
+    "default_headers": {
+      "Content-Type": "application/json",
+      "User-Agent": "MarketplaceGateway/1.0",
+      "X-Forwarded-By": "apisix-webhook-forwarder",
+      "X-Webhook-Source": "{{marketplace}}"
+    }
+  },
+  "targets": [
+    {
+      "_comment": "─────────────────────────────────────────────────────────────────\nCONTOH 2 — ORDER STATUS WEBHOOK (SHOPEE SAJA — SATU TARGET PER MARKETPLACE)\n─────────────────────────────────────────────────────────────────\nForward webhook order status ke backend Synchronization Service.\n\nSignal: code=3 (order_status_push) — HANYA Shopee.\nTikTok type=1 (order_status_change) punya target SENDIRI di bawah\n(id order-status-backend-tiktok). Pemisahan per marketplace ini membuat\nforward LEBIH STRICT: Shopee code=1 atau TikTok type=3 TIDAK lagi\nter-forward ke backend (dulu marketplace=all + signal_codes [3,1]\nmembuat kombinasi silang itu lolos).\n\nBackend akan:\n  1. Menerima webhook\n  2. Ekstrak order_id & status\n  3. Fetch detail order via APISIX\n  4. Log ke file: backendbaru/logs/webhook/order_webhook.log\n\nURL Backend: disesuaikan dengan environment Anda.\n  - Local dev: http://host.docker.internal:8000/api/v1/webhook/order/status\n  - Production: https://backend-anda.com/api/v1/webhook/order/status\n\n⚠ PASTIKAN URL BENAR sebelum di-enable!\n\nPAYLOAD: mode \"raw\" → backend menerima body ASLI marketplace apa adanya\n(TikTok: type=1 + data.order_id/data.order_status;\n Shopee: code=3 + data.ordersn/data.status)\nsehingga backend bisa mendeteksi marketplace sendiri dari field type/code.\nMetadata tetap tersedia di header X-Webhook-Source dan query ?marketplace=.\nJANGAN pakai mode \"wrapped\" untuk target ini: body pesan tidak akan\nmengandung type/code di level atas sehingga backend gagal deteksi marketplace.",
+      "id": "order-status-backend-shopee",
+      "description": "Forward ORDER STATUS Shopee (code=3) ke backend sync service",
+      "enabled": true,
+      "marketplace": "shopee",
+      "signal_codes": [
+        3
+      ],
+      "exclude_codes": [],
+      "method": "POST",
+      "url": "http://localhost:8000/api/v1/webhook/order/status",
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Forwarded-By": "apisix-webhook-forwarder",
+        "X-Webhook-Source": "{{marketplace}}"
+      },
+      "query": {
+        "marketplace": "{{marketplace}}"
+      },
+      "conditions": [],
+      "payload": {
+        "mode": "raw"
+      }
+    },
+    {
+      "_comment": "─────────────────────────────────────────────────────────────────\nCONTOH 3 — ORDER STATUS WEBHOOK (TIKTOK SAJA)\n─────────────────────────────────────────────────────────────────\nPasangan CONTOH 2: target terpisah supaya filter signal code lebih strict.\n\nSignal: type=1 (order_status_change) — HANYA TikTok.\n  Shopee code=3 punya target sendiri (order-status-backend-shopee).\n\nPayload mode raw → body ASLI TikTok diteruskan apa adanya\n(type=1 + data.order_id/data.order_status + shop_id + timestamp).\nMetadata tetap ada di header X-Webhook-Source / X-Webhook-Target dan\nquery ?marketplace=tiktok.\n\nMenambah marketplace lain? Salin objek ini, ubah id + marketplace +\nsignal_codes. Simpan file → langsung berlaku, TANPA restart container.",
+      "id": "order-status-backend-tiktok",
+      "description": "Forward ORDER STATUS TikTok (type=1) ke backend sync service",
+      "enabled": true,
+      "marketplace": "tiktok",
+      "signal_codes": [
+        1
+      ],
+      "exclude_codes": [],
+      "method": "POST",
+      "url": "http://localhost:8000/api/v1/webhook/order/status",
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Forwarded-By": "apisix-webhook-forwarder",
+        "X-Webhook-Source": "{{marketplace}}"
+      },
+      "query": {
+        "marketplace": "{{marketplace}}"
+      },
+      "conditions": [],
+      "payload": {
+        "mode": "raw"
+      }
+    }
+  ],
+  "registrations": []
+}

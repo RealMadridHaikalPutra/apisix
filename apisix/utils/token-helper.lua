@@ -33,6 +33,11 @@ local TIKTOK_AUTH_BASE_URL     = "https://auth.tiktok-shops.com"
 local TIKTOK_AUTH_TOKEN_PATH   = "/api/v2/token/get"
 local TIKTOK_AUTH_REFRESH_PATH = "/api/v2/token/refresh"
 
+-- Lazada Open Platform — host auth SAMA untuk semua region (SG/MY/TH/VN/ID/PH)
+local LAZADA_AUTH_BASE_URL     = "https://auth.lazada.com/rest"
+local LAZADA_AUTH_TOKEN_PATH   = "/auth/token/create"
+local LAZADA_AUTH_REFRESH_PATH = "/auth/token/refresh"
+
 -- ── Helper: Make HTTP request ─────────────────────────────────────────────
 
 --- Make an HTTP request with timeout, returning the parsed response.
@@ -451,6 +456,192 @@ function _M.tiktok_refresh_token(credentials)
     return token_data, nil
 end
 
+-- ── Lazada Token Operations ──────────────────────────────────────────────
+
+--- Build a Lazada auth URL (GET) with sha256 signature.
+-- Signature = UPPERCASE HMAC-SHA256(app_secret, api_path + sorted key+value).
+-- Timestamp Lazada memakai MILLISECONDS.
+-- @param app_secret - Lazada app secret
+-- @param api_path - Auth API path
+-- @param params - Query params (tanpa sign), sudah termasuk app_key + timestamp
+-- @return string - Full URL siap dipanggil
+local function build_lazada_auth_url(app_secret, api_path, params)
+    local sign = signature.lazada_sign(app_secret, api_path, params)
+
+    local parts = {}
+    for k, v in pairs(params) do
+        parts[#parts + 1] = string.format("%s=%s", k, ngx.escape_uri(tostring(v)))
+    end
+    parts[#parts + 1] = "sign=" .. sign
+
+    return string.format("%s%s?%s", LAZADA_AUTH_BASE_URL, api_path, table.concat(parts, "&"))
+end
+
+--- Cek apakah response Lazada menandakan error.
+-- Sukses: code == "0" (string) atau 0 (number).
+-- @param res - Parsed response table
+-- @return string|nil - Pesan error, atau nil jika sukses
+local function lazada_error_message(res)
+    if not res or type(res) ~= "table" then
+        return nil
+    end
+    local code = res.code
+    if code == nil or code == cjson.null then
+        return nil
+    end
+    if tostring(code) == "0" then
+        return nil
+    end
+    return string.format("Lazada error '%s': %s", tostring(code), tostring(res.message or "unknown error"))
+end
+
+--- Get initial Lazada access token using the authorization code.
+-- GET https://auth.lazada.com/rest/auth/token/create?code=...&app_key=...
+--     &sign_method=sha256&timestamp=<ms>&sign=<sig>
+--
+-- @param credentials - Combined credentials (app_key, app_secret, auth_code)
+-- @return table|nil, string|nil - (token_data, error_message)
+function _M.lazada_get_token(credentials)
+    local app_key    = credentials.app_key
+    local app_secret = credentials.app_secret
+    local auth_code  = credentials.auth_code
+
+    if not app_key or not app_secret then
+        return nil, "missing Lazada global credentials (app_key, app_secret)"
+    end
+    if not auth_code or auth_code == "" then
+        return nil, "missing auth_code — get one from Lazada OAuth flow"
+    end
+
+    local params = {
+        app_key     = app_key,
+        code        = auth_code,
+        sign_method = "sha256",
+        timestamp   = signature.generate_timestamp_ms(),
+    }
+
+    local url = build_lazada_auth_url(app_secret, LAZADA_AUTH_TOKEN_PATH, params)
+
+    logger.info("Requesting Lazada access token", {
+        app_key       = app_key,
+        has_auth_code = auth_code ~= nil and auth_code ~= "",
+    })
+
+    local res, err = make_request({
+        method  = "GET",
+        url     = url,
+        timeout = 15000,
+    })
+
+    if not res then
+        return nil, "Lazada token request failed: " .. (err or "unknown error")
+    end
+
+    local err_msg = lazada_error_message(res)
+    if err_msg then
+        return nil, err_msg
+    end
+
+    if not res.access_token then
+        return nil, "Lazada response missing access_token"
+    end
+
+    local current_time = ngx.time()
+    local expires_in = tonumber(res.expires_in) or 864000          -- default 10 hari
+    local refresh_expires_in = tonumber(res.refresh_expires_in)    -- 50 hari
+
+    local token_data = {
+        access_token             = res.access_token,
+        refresh_token            = res.refresh_token or credentials.refresh_token,
+        access_token_expires_at  = current_time + expires_in,
+        refresh_token_expires_at = refresh_expires_in
+            and (current_time + refresh_expires_in) or nil,
+        country                  = res.country,
+        account                  = res.account,
+    }
+
+    logger.info("Lazada access token obtained successfully", {
+        expires_in = expires_in,
+        country    = res.country,
+    })
+
+    return token_data, nil
+end
+
+--- Refresh Lazada access token.
+-- GET https://auth.lazada.com/rest/auth/token/refresh?refresh_token=...&app_key=...
+--     &sign_method=sha256&timestamp=<ms>&sign=<sig>
+--
+-- Catatan: refresh token Lazada TIDAK diperpanjang oleh RefreshAccessToken —
+-- refresh_token_expires_at hanya diperbarui bila API mengembalikannya.
+--
+-- @param credentials - Combined credentials (app_key, app_secret, refresh_token)
+-- @return table|nil, string|nil - (token_data, error_message)
+function _M.lazada_refresh_token(credentials)
+    local app_key       = credentials.app_key
+    local app_secret    = credentials.app_secret
+    local refresh_token = credentials.refresh_token
+
+    if not app_key or not app_secret then
+        return nil, "missing Lazada global credentials (app_key, app_secret)"
+    end
+    if not refresh_token or refresh_token == "" then
+        return nil, "REAUTH_REQUIRED: missing refresh_token — need to re-authenticate"
+    end
+
+    local params = {
+        app_key       = app_key,
+        refresh_token = refresh_token,
+        sign_method   = "sha256",
+        timestamp     = signature.generate_timestamp_ms(),
+    }
+
+    local url = build_lazada_auth_url(app_secret, LAZADA_AUTH_REFRESH_PATH, params)
+
+    logger.info("Refreshing Lazada access token")
+
+    local res, err = make_request({
+        method  = "GET",
+        url     = url,
+        timeout = 15000,
+    })
+
+    if not res then
+        return nil, "Lazada token refresh failed: " .. (err or "unknown error")
+    end
+
+    local err_msg = lazada_error_message(res)
+    if err_msg then
+        local lower = err_msg:lower()
+        if lower:find("invalid") or lower:find("expir") or lower:find("code") then
+            return nil, "REAUTH_REQUIRED: refresh token is invalid or expired — " .. err_msg
+        end
+        return nil, err_msg
+    end
+
+    if not res.access_token then
+        return nil, "Lazada refresh response missing access_token"
+    end
+
+    local current_time = ngx.time()
+    local expires_in = tonumber(res.expires_in) or 864000
+    local refresh_expires_in = tonumber(res.refresh_expires_in)
+
+    local token_data = {
+        access_token             = res.access_token,
+        refresh_token            = res.refresh_token or credentials.refresh_token,
+        access_token_expires_at  = current_time + expires_in,
+        refresh_token_expires_at = refresh_expires_in
+            and (current_time + refresh_expires_in) or nil,
+    }
+
+    logger.info("Lazada access token refreshed successfully", {
+        expires_in = expires_in,
+    })
+
+    return token_data, nil
+end
+
 -- ── Generic Token Operations ──────────────────────────────────────────────
 
 --- Get an initial access token for a given marketplace.
@@ -462,6 +653,8 @@ function _M.get_token(marketplace, credentials)
         return _M.shopee_get_token(credentials)
     elseif marketplace == "tiktok" then
         return _M.tiktok_get_token(credentials)
+    elseif marketplace == "lazada" then
+        return _M.lazada_get_token(credentials)
     else
         return nil, string.format("unsupported marketplace: %s", marketplace)
     end
@@ -476,6 +669,8 @@ function _M.refresh_token(marketplace, credentials)
         return _M.shopee_refresh_token(credentials)
     elseif marketplace == "tiktok" then
         return _M.tiktok_refresh_token(credentials)
+    elseif marketplace == "lazada" then
+        return _M.lazada_refresh_token(credentials)
     else
         return nil, string.format("unsupported marketplace: %s", marketplace)
     end

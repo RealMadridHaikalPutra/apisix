@@ -1,0 +1,27 @@
+══════════════════════════════════════════════════════════════════
+  FULL TEST SUITE — Wed, Jul 29, 2026 10:52:07 PM
+  Gateway: http://localhost:9080
+══════════════════════════════════════════════════════════════════
+
+Configuration:
+  Shopee UUID: my-shopee-shop
+  Shopee Product: 802023254
+  TikTok UUID: my-tiktok-shop
+  TikTok Product: 1729592969712207008
+  Delay: 3s
+
+[2026-07-29 22:52:07] [STEP] ═════════════════════════════════════════════════════════════
+[2026-07-29 22:52:07] [STEP]   SECTION 1: AUTH ENDPOINTS
+[2026-07-29 22:52:07] [STEP] ═════════════════════════════════════════════════════════════
+[2026-07-29 22:52:07] [INFO] ⏳ Jeda 3s sebelum: Shopee Auth Status...
+[2026-07-29 22:52:11] [STEP] ▶ Auth Status — Shopee
+[2026-07-29 22:52:11] [INFO]   POST http://localhost:9080/auth/status
+
+═══════════════════════════════════════════════════════
+[RESPONSE] unknown | Auth Status — Shopee | HTTP 400
+───────────────────────────────────────────────────────
+{"error":{"code":"CREDENTIALS_ERROR","marketplace":"shopee","message":"shop 'my-shopee-shop' not found"}}
+═══════════════════════════════════════════════════════
+
+[2026-07-29 22:52:13] [FAIL] ✗ Auth Status — Shopee — expected pattern 'has_token' not found
+[2026-07-29 22:52:13] [FAIL]   HTTP Status: 400

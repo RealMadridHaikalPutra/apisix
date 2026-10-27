@@ -27,6 +27,7 @@ COPY apisix/utils/         /usr/local/apisix/custom/utils/
 COPY apisix/credentials/   /usr/local/apisix/custom/credentials/
 COPY apisix/mappings/      /usr/local/apisix/custom/mappings/
 COPY apisix/update-config.json /usr/local/apisix/custom/update-config.json
+COPY apisix/webhook-config.json /usr/local/apisix/custom/webhook-config.json
 COPY apisix/standardization-config.json /usr/local/apisix/custom/standardization-config.json
 COPY apisix/content-mapping.json /usr/local/apisix/custom/content-mapping.json
 COPY config-center/ /usr/local/apisix/custom/config-center/

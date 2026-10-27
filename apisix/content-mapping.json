@@ -1,6 +1,6 @@
 {
-  "description": "CONTENT MAPPING: kamus nilai marketplace (Shopee & TikTok) → nilai internal untuk variabel APAPUN (status, kategori, brand, dll). standardization-config.json MEMBACA file ini TERLEBIH DAHULU, baru menerjemahkan data ke format seragam.",
-  "version": "1.0.0",
+  "description": "CONTENT MAPPING: kamus nilai marketplace (Shopee, TikTok & Lazada) → nilai internal untuk variabel APAPUN (status, kategori, brand, dll). standardization-config.json MEMBACA file ini TERLEBIH DAHULU, baru menerjemahkan data ke format seragam.",
+  "version": "1.1.0",
   "fields": {
     "status": {
       "description": "Mapping status produk marketplace → status internal gateway. DUA FORMAT didukung per marketplace: (1) array: \"INTERNAL\": [\"NATIVE_1\", \"NATIVE_2\"] — banyak nilai native ke satu internal (native pertama = primary untuk arah ke marketplace); (2) sederhana: \"NATIVE\": \"internal\" — satu native ke satu internal.",
@@ -15,11 +15,11 @@
       ],
       "mappings": {
         "shopee": {
-          "ACTIVE": ["NORMAL"],
-          "INACTIVE": ["UNLIST"],
+          "ACTIVE": ["NORMAL", "MODEL_NORMAL"],
+          "INACTIVE": ["UNLIST", "MODEL_UNLIST"],
           "PENDING": ["REVIEWING"],
-          "REJECTED": ["BANNED"],
-          "DELETED": ["SELLER_DELETE", "SHOPEE_DELETE"]
+          "REJECTED": ["BANNED", "MODEL_BANNED"],
+          "DELETED": ["SELLER_DELETE", "SHOPEE_DELETE", "MODEL_DELETE"]
         },
         "tiktok": {
           "ACTIVE": ["ACTIVATE"],
@@ -29,6 +29,14 @@
           "SUSPENDED": ["PLATFORM_DEACTIVATED", "FREEZE"],
           "DRAFT": ["DRAFT"],
           "DELETED": ["DELETED"]
+        },
+        "lazada": {
+          "ACTIVE": ["live"],
+          "INACTIVE": ["inactive"],
+          "PENDING": ["pending"],
+          "REJECTED": ["rejected"],
+          "SUSPENDED": ["sold-out"],
+          "DELETED": ["deleted"]
         }
       }
     },
@@ -43,6 +51,9 @@
         },
         "tiktok": {
           "product_id": ["id"]
+        },
+        "lazada": {
+          "product_id": ["item_id"]
         }
       }
     },
@@ -55,6 +66,9 @@
         },
         "tiktok": {
           "NATIVE_CATEGORY_TIKTOK": "internal_category"
+        },
+        "lazada": {
+          "NATIVE_CATEGORY_LAZADA": "internal_category"
         }
       }
     }

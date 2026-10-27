@@ -83,6 +83,14 @@ function _M.generate_timestamp()
     return math.floor(ngx.time())
 end
 
+--- Generate a Unix timestamp in MILLISECONDS.
+-- Lazada requires a millisecond timestamp (e.g. 1517820392000) and rejects
+-- requests whose timestamp differs from UTC by more than 7200 seconds.
+-- @return number - Current Unix timestamp in milliseconds
+function _M.generate_timestamp_ms()
+    return math.floor(ngx.now() * 1000)
+end
+
 --- Sort a table's keys alphabetically and return key=value pairs joined.
 -- Used for Shopee signature generation where params must be sorted.
 -- @param params - Table of key-value pairs
@@ -121,6 +129,48 @@ function _M.shopee_sign(partner_key, partner_id, api_path, timestamp, access_tok
     )
     local signature = hmac_sha256(partner_key, base_string, true)
     return signature, timestamp
+end
+
+--- Generate Lazada Open Platform signature (sign_method=sha256).
+-- Lazada canonical string:
+--   base_string = api_path + sorted_key1value1key2value2...
+--   signature   = UPPERCASE( HMAC-SHA256(app_secret, base_string) )
+--
+-- Semua parameter yang dikirim di QUERY ikut ditandatangani (kecuali `sign`).
+-- Untuk request POST Lazada, parameter bisnis dikirim di JSON body dan TIDAK
+-- ikut ditandatangani — hanya system params (app_key, timestamp, access_token,
+-- sign_method) yang ditandatangani. Caller (lazada-adapter) yang menentukan
+-- daftar params yang masuk ke signature.
+--
+-- @param app_secret - Lazada app secret (HMAC key)
+-- @param api_path - API path, e.g. "/products/get"
+-- @param params - Table of params to sign (MUST NOT contain `sign`)
+-- @return string - Uppercase hex-encoded HMAC-SHA256 signature
+function _M.lazada_sign(app_secret, api_path, params)
+    params = params or {}
+    api_path = api_path or ""
+
+    -- Sort keys alphabetically, skipping `sign` and non-scalar values
+    local keys = {}
+    for k, v in pairs(params) do
+        if k ~= "sign" and v ~= nil and type(v) ~= "table" then
+            keys[#keys + 1] = k
+        end
+    end
+    str_sort(keys)
+
+    local parts = { api_path }
+    for _, k in ipairs(keys) do
+        local v = params[k]
+        if type(v) == "boolean" then
+            v = v and "true" or "false"
+        end
+        parts[#parts + 1] = str_format("%s%s", k, tostring(v))
+    end
+
+    local base_string = concat(parts)
+    local signature = hmac_sha256(app_secret, base_string, true)
+    return signature:upper()
 end
 
 --- Generate TikTok app signature.

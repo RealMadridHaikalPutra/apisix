@@ -29,6 +29,12 @@ _M.endpoints = {
       method = "POST",
       version = "202502",
     },
+    -- Lazada GetProducts — query params: filter, limit (max 50), offset,
+    -- options, sku_seller_list. Docs: GET /products/get
+    lazada = {
+      path   = "/products/get",
+      method = "GET",
+    },
   },
 
   -- ── Product Detail ──────────────────────────────────────────────────────
@@ -41,6 +47,11 @@ _M.endpoints = {
       path   = "/product/202309/products/{product_id}",
       method = "GET",
       version = "202309",
+    },
+    -- Lazada GetProductItem — by item_id (docs: GET /product/item/get)
+    lazada = {
+      path   = "/product/item/get",
+      method = "GET",
     },
   },
 
@@ -56,6 +67,13 @@ _M.endpoints = {
       version = "202407",
       base_url = "https://auth.tiktok-shops.com",
     },
+    -- Lazada GenerateAccessToken — semua region memakai host auth yang sama
+    -- (https://auth.lazada.com/rest/auth/token/create).
+    lazada = {
+      path   = "/auth/token/create",
+      method = "GET",
+      base_url = "https://auth.lazada.com/rest",
+    },
   },
 
   -- ── Auth: Refresh Token ─────────────────────────────────────────────────
@@ -69,6 +87,12 @@ _M.endpoints = {
       method = "GET",
       version = "202407",
       base_url = "https://auth.tiktok-shops.com",
+    },
+    -- Lazada RefreshAccessToken — https://auth.lazada.com/rest/auth/token/refresh
+    lazada = {
+      path   = "/auth/token/refresh",
+      method = "GET",
+      base_url = "https://auth.lazada.com/rest",
     },
   },
 
@@ -91,6 +115,14 @@ _M.endpoints = {
       path   = "/product/202309/products/{product_id}/inventory/update",
       method = "POST",
       version = "202309",
+    },
+    -- Lazada EditChoiceSkuStock — POST /choice/stock/edit.
+    -- Body: { item_id, site, sku_edit_stock: { "<sku_id>": sellable_stock } }.
+    -- Business params dikirim di JSON body (bukan query) — lihat
+    -- parameter-mapping.lazada_update_stock_body.
+    lazada = {
+      path   = "/choice/stock/edit",
+      method = "POST",
     },
   },
 
@@ -160,6 +192,11 @@ _M.endpoints = {
       method = "POST",
       version = "202309",
     },
+    -- Lazada GetOrders — GET /orders/get (offset/limit pagination).
+    lazada = {
+      path   = "/orders/get",
+      method = "GET",
+    },
   },
 
   -- ── Order Detail ────────────────────────────────────────────────────────
@@ -172,6 +209,40 @@ _M.endpoints = {
       path   = "/order/202507/orders",
       method = "GET",
       version = "202507",
+    },
+    -- Lazada GetOrderItems — GET /order/items/get?order_id=...
+    -- Satu order_id per call (request-transformer meloop untuk multi-id).
+    lazada = {
+      path   = "/order/items/get",
+      method = "GET",
+    },
+  },
+
+  -- ── Ship Order / Ship Package ───────────────────────────────────────────
+  -- Shopee: POST /api/v2/logistics/ship_order
+  -- TikTok: POST /fulfillment/202309/packages/{package_id}/ship
+  ship_order = {
+    shopee = {
+      path   = "/api/v2/logistics/ship_order",
+      method = "POST",
+    },
+    tiktok = {
+      path   = "/fulfillment/202309/packages/{package_id}/ship",
+      method = "POST",
+      version = "202309",
+    },
+  },
+
+  -- ── Shipping Parameter ───────────────────────────────────────────────────────
+  -- Shopee: POST /api/v2/logistics/get_shipping_parameter
+  -- Dipakai SCANNING internal sebelum ship PICKUP: mengembalikan daftar alamat
+  -- penjemputan + opsi pickup_time_id yang valid untuk sebuah order, sehingga
+  -- gateway tidak perlu mempercayai address_id / time_slot_id dari client
+  -- (nilai placeholder membuat Shopee membalas `error_server`).
+  shipping_parameter = {
+    shopee = {
+      path   = "/api/v2/logistics/get_shipping_parameter",
+      method = "POST",
     },
   },
 
@@ -196,7 +267,32 @@ function _M.get_endpoint(endpoint_name, marketplace)
     return nil
   end
 
-  return endpoint_group[marketplace]
+  local endpoint = endpoint_group[marketplace]
+  if not endpoint then
+    return nil
+  end
+
+  -- Override opsional dari update-config.json:
+  --   endpoints.<endpoint>.<marketplace>.api = { path = "...", method = "POST" }
+  -- Berguna untuk endpoint yang path/method-nya berubah tanpa perlu deploy
+  -- ulang kode Lua (mis. ship_order). Nilai lain (version/base_url) tetap
+  -- diambil dari definisi Lua.
+  local ok, update_config = pcall(require, "utils.update-config")
+  if ok and update_config and update_config.get_endpoint_config then
+    local ok_cfg, ep_cfg = pcall(update_config.get_endpoint_config, endpoint_name)
+    local mp_cfg = ok_cfg and type(ep_cfg) == "table" and ep_cfg[marketplace] or nil
+    local api = type(mp_cfg) == "table" and mp_cfg.api or nil
+    if type(api) == "table" and type(api.path) == "string" and api.path ~= "" then
+      return {
+        path     = api.path,
+        method   = api.method or endpoint.method,
+        version  = endpoint.version,
+        base_url = endpoint.base_url,
+      }
+    end
+  end
+
+  return endpoint
 end
 
 --- Check if a unified endpoint exists for a given marketplace.

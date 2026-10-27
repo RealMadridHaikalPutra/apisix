@@ -99,6 +99,28 @@ local ENDPOINT_BODY_FIELDS = {
         condition                      = true,
         weight                         = true,
     },
+    ship_order = {
+        order_sn             = true,
+        order_id             = true,
+        package_id           = true,
+        package_number       = true,
+        handover_method      = true,
+        pickup               = true,
+        dropoff              = true,
+        non_integrated       = true,
+        pickup_slot          = true,
+        self_shipment        = true,
+        address_id           = true,
+        pickup_time_id       = true,
+        time_slot_id         = true,
+        tracking_number      = true,
+        branch_id            = true,
+        sender_real_name     = true,
+        slug                 = true,
+        start_time           = true,
+        end_time             = true,
+        shipping_provider_id = true,
+    },
 }
 
 -- ── Config Loader ─────────────────────────────────────────────────────────
@@ -249,6 +271,69 @@ function _M.get_updatable_fields(endpoint, marketplace, body_data)
     end
 
     return result
+end
+
+-- ── Public: get_endpoint_config ──────────────────────────────────────────
+
+--- Ambil seluruh blok config sebuah endpoint (semua marketplace + shared).
+-- Dipakai untuk konfigurasi yang tidak spesifik marketplace, mis.
+-- `handover_aliases`, `infer_order`, dan `request_map` ship_order.
+--
+-- @param endpoint - Unified endpoint name (mis. "ship_order")
+-- @return table - Endpoint config (kosong jika tidak ada)
+function _M.get_endpoint_config(endpoint)
+    if not endpoint then
+        return {}
+    end
+
+    local config = load_config()
+    if not config or type(config.endpoints) ~= "table" then
+        return {}
+    end
+
+    local ep_config = config.endpoints[endpoint]
+    if type(ep_config) ~= "table" then
+        return {}
+    end
+
+    return ep_config
+end
+
+-- ── Public: get_options ──────────────────────────────────────────────────
+
+--- Ambil opsi konfigurasi non-whitelist untuk endpoint + marketplace.
+-- Blok `options` dipakai untuk nilai yang mengatur perilaku translasi
+-- (mis. default_pickup_duration_seconds) tanpa mengubah kode.
+--
+-- @param endpoint - Unified endpoint name (mis. "ship_order")
+-- @param marketplace - Marketplace name (mis. "tiktok")
+-- @return table - Options table (kosong jika tidak ada)
+function _M.get_options(endpoint, marketplace)
+    if not endpoint or not marketplace then
+        return {}
+    end
+
+    local config = load_config()
+    if not config or not config.endpoints then
+        return {}
+    end
+
+    local ep_config = config.endpoints[endpoint]
+    if not ep_config then
+        return {}
+    end
+
+    local mp_config = ep_config[marketplace]
+    if not mp_config then
+        return {}
+    end
+
+    local options = mp_config.options
+    if type(options) ~= "table" then
+        return {}
+    end
+
+    return options
 end
 
 -- ── Public: is_endpoint_disabled ──────────────────────────────────────────

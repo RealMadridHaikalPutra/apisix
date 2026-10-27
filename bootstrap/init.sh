@@ -37,7 +37,10 @@
 set -e
 
 # ── Configuration ──────────────────────────────────────────────────────────
-ADMIN_API="http://apisix:9180/apisix/admin"
+# ADMIN_API bisa di-override agar script ini juga bisa dipakai untuk MEMPERBAIKI
+# route dari host (container APISIX sudah jalan tapi route hilang/berubah):
+#   ADMIN_API=http://localhost:9180/apisix/admin sh bootstrap/init.sh
+ADMIN_API="${ADMIN_API:-http://apisix:9180/apisix/admin}"
 API_KEY="edd1c9f034335f136f87ad84b625c8f1"
 
 # ── Helper Functions ───────────────────────────────────────────────────────
@@ -70,6 +73,7 @@ register_upstream() {
     fi
 }
 
+FAIL_COUNT=0
 register_route() {
     id=$1
     desc=$2
@@ -89,7 +93,7 @@ register_route() {
             -H "X-API-KEY: $API_KEY" \
             -H "Content-Type: application/json" \
             -d "$data" 2>&1 || true
-        exit 1
+        FAIL_COUNT=$((FAIL_COUNT + 1))
     fi
 }
 
@@ -115,6 +119,17 @@ register_upstream 2 "TikTok Products" "open-api.tiktokglobalshop.com" "https"
 # Digunakan untuk: Token, Refresh Token
 # URL Auth TikTok: https://auth.tiktok-shops.com/api/v2/token/get
 register_upstream 3 "TikTok Auth" "auth.tiktok-shops.com" "https"
+
+# Upstream 4: Lazada
+# Host default: api.lazada.sg (Singapore).
+# CATATAN: Lazada punya host API PER REGION. Request sebenarnya dibuat oleh
+# request-transformer via resty.http memakai credentials.base_url dari
+# credentials.json (global.lazada.base_url), jadi upstream ini hanya
+# placeholder untuk Admin API/route.
+#   MY: https://api.lazada.com.my/rest   TH: https://api.lazada.co.th/rest
+#   VN: https://api.lazada.vn/rest       ID: https://api.lazada.co.id/rest
+#   PH: https://api.lazada.com.ph/rest   SG: https://api.lazada.sg/rest
+register_upstream 4 "Lazada" "api.lazada.sg" "https"
 
 # Step 2: Register routes
 log "--- Registering Routes ---"
@@ -302,6 +317,71 @@ register_route 13c "Update Stock (all - rejected)" '{
     "upstream_id": 1
 }'
 
+# ── Route 21: Products — Lazada ────────────────────────────────────────
+# Match: GET|POST /products* with query parameter marketplace=lazada
+#   GET /products      → Lazada GetProducts (GET /products/get)
+#   GET /products/{id} → Lazada GetProductItem (GET /product/item/get)
+#   POST /products     → Ditolak (Lazada tidak punya POST /products)
+# Upstream: 4 (placeholder — call sebenarnya via resty.http + credentials.base_url)
+register_route 21 "Products (Lazada)" '{
+    "methods": ["GET", "POST"],
+    "uri": "/products*",
+    "vars": [["arg_marketplace", "==", "lazada"]],
+    "plugins": {
+        "credential-loader": {},
+        "marketplace-router": {},
+        "request-transformer": {}
+    },
+    "upstream_id": 4
+}'
+
+# ── Route 22: Update Stock — Lazada ────────────────────────────────────
+# Match: POST /update-stock* with query parameter marketplace=lazada
+# Uses Lazada API: POST /choice/stock/edit (EditChoiceSkuStock)
+# Wajib menyertakan `site` (SG/MY/ID/PH/TH/VN) di body/query.
+register_route 22 "Update Stock (Lazada)" '{
+    "methods": ["POST"],
+    "uri": "/update-stock*",
+    "vars": [["arg_marketplace", "==", "lazada"]],
+    "plugins": {
+        "credential-loader": {},
+        "marketplace-router": {},
+        "request-transformer": {}
+    },
+    "upstream_id": 4
+}'
+
+# ── Route 23: Orders — Lazada ──────────────────────────────────────────
+# Match: GET /order* with query parameter marketplace=lazada
+#   GET /order (no ids)  → GetOrders (GET /orders/get)
+#   GET /order?ids=...   → GetOrderItems (GET /order/items/get, per order_id)
+register_route 23 "Orders (Lazada)" '{
+    "methods": ["GET"],
+    "uri": "/order*",
+    "vars": [["arg_marketplace", "==", "lazada"]],
+    "plugins": {
+        "credential-loader": {},
+        "marketplace-router": {},
+        "request-transformer": {}
+    },
+    "upstream_id": 4
+}'
+
+# ── Route 24: Update Status — Lazada (ditolak rapi) ────────────────────
+# Route dibuat agar request sampai ke request-transformer → 400
+# ENDPOINT_NOT_SUPPORTED (bukan 404/500).
+register_route 24 "Update Status (Lazada - unsupported)" '{
+    "methods": ["POST"],
+    "uri": "/update-status*",
+    "vars": [["arg_marketplace", "==", "lazada"]],
+    "plugins": {
+        "credential-loader": {},
+        "marketplace-router": {},
+        "request-transformer": {}
+    },
+    "upstream_id": 4
+}'
+
 # ── Route 14: Orders — TikTok ───────────────────────────────────────────
 # Match: GET /order* with query parameter marketplace=tiktok
 # Sub-endpoints (handled by request-transformer plugin):
@@ -338,6 +418,56 @@ register_route 15 "Orders (Shopee)" '{
     "plugins": {
         "credential-loader": {},
         "marketplace-router": {},
+        "request-transformer": {}
+    },
+    "upstream_id": 1
+}'
+
+# ── Route 16: Ship Order / Package — Shopee ─────────────────────────────
+# Match: POST /ship* with query parameter marketplace=shopee
+# Supports: POST /ship-order, POST /ship-order/{id}, POST /ship, POST /ship-package, POST /request-pickup, POST /pickup
+# Uses Shopee API: POST /api/v2/logistics/ship_order
+# Upstream: 1 (partner.shopeemobile.com)
+register_route 16 "Ship Order (Shopee)" '{
+    "methods": ["POST"],
+    "uris": ["/ship*", "/request-pickup*", "/pickup*"],
+    "vars": [["arg_marketplace", "==", "shopee"]],
+    "plugins": {
+        "credential-loader": {},
+        "marketplace-router": {},
+        "request-transformer": {}
+    },
+    "upstream_id": 1
+}'
+
+# ── Route 17: Ship Order / Package — TikTok ─────────────────────────────
+# Match: POST /ship*, /request-pickup*, /pickup* with query parameter marketplace=tiktok
+# Supports: POST /ship-order, POST /ship-order/{id}, POST /ship, POST /ship-package/{id}, POST /request-pickup, POST /pickup
+# Uses TikTok API: POST /fulfillment/202309/packages/{package_id}/ship
+# Upstream: 2 (open-api.tiktokglobalshop.com)
+register_route 17 "Ship Order (TikTok)" '{
+    "methods": ["POST"],
+    "uris": ["/ship*", "/request-pickup*", "/pickup*"],
+    "vars": [["arg_marketplace", "==", "tiktok"]],
+    "plugins": {
+        "credential-loader": {},
+        "marketplace-router": {},
+        "request-transformer": {}
+    },
+    "upstream_id": 2
+}'
+
+# ── Route 17B: Ship Order / Package — marketplace=all (ditolak) ─────────
+# Match: POST /ship*, /request-pickup*, /pickup* with query parameter marketplace=all
+# ship_order adalah mutasi per-order/per-package — fan-out TIDAK didukung.
+# Route ini sengaja dibuat agar request sampai ke request-transformer
+# yang merespon error INVALID_MARKETPLACE (bukan 404 Route Not Found).
+register_route 17b "Ship Order (all - rejected)" '{
+    "methods": ["POST"],
+    "uris": ["/ship*", "/request-pickup*", "/pickup*"],
+    "vars": [["arg_marketplace", "==", "all"]],
+    "plugins": {
+        "credential-loader": {},
         "request-transformer": {}
     },
     "upstream_id": 1
@@ -393,6 +523,19 @@ register_route 7 "Webhook (TikTok)" '{
     "upstream_id": 1
 }'
 
+# ── Route 25: Webhook — Lazada (Push Mechanism) ───────────────────
+# Match: POST /webhook/lazada (menerima SEMUA push dari Lazada)
+# Lazada events: message_type 0 (trade/reverse order), 3/4/5 (product)
+# Signature: header Authorization = HEX(HMAC-SHA256(AppSecret, AppKey + RawBody))
+register_route 25 "Webhook (Lazada)" '{
+    "methods": ["POST"],
+    "uri": "/webhook/lazada",
+    "plugins": {
+        "webhook-receiver": {}
+    },
+    "upstream_id": 4
+}'
+
 # Route 10: Auth Token Management (POST /auth/*)
 # Sub-routes:
 #   POST /auth/token    → Get initial access token
@@ -436,6 +579,12 @@ if [ -f /tmp/routes.json ]; then
     rm -f /tmp/routes.json
 fi
 
+if [ "$FAIL_COUNT" -gt 0 ]; then
+    log ""
+    log "⚠ WARNING: $FAIL_COUNT route(s) failed to register!"
+    log "   Run fix-missing-routes.sh to retry failed routes."
+fi
+
 log "=== Bootstrap Complete! ==="
 log "Gateway:   http://localhost:9080"
 log "Dashboard: http://localhost:9180/ui/"
@@ -445,6 +594,7 @@ log "Upstreams:"
 log "  1 - Shopee        : partner.shopeemobile.com"
 log "  2 - TikTok Products : open-api.tiktokglobalshop.com"
 log "  3 - TikTok Auth     : auth.tiktok-shops.com"
+log "  4 - Lazada          : api.lazada.sg (default; region lain via credentials.base_url)"
 log ""
 log "Routes:"
 log "  1  - GET|POST /products* (marketplace=shopee)       → Shopee Upstream"
@@ -457,6 +607,7 @@ log "  4  - POST /update-stock* (marketplace=shopee)       → Shopee Upstream"
 log "  5  - POST /update-stock* (marketplace=tiktok)       → TikTok Upstream"
 log "  6  - POST /webhook/shopee                           → Webhook (Shopee)"
 log "  7  - POST /webhook/tiktok                           → Webhook (TikTok)"
+log "  25 - POST /webhook/lazada                           → Webhook (Lazada Push)"
 log "  8  - GET|POST /webhook/register                     → Webhook URL Registration"
 log "  10 - POST /auth/*                                   → Token Management"
 log "  12 - POST /update-status* (marketplace=shopee)      → Shopee Upstream"
@@ -464,6 +615,13 @@ log "  13 - POST /update-status* (marketplace=tiktok)      → TikTok Upstream"
 log "  13c- POST /update-stock* (marketplace=all)          → Ditolak (INVALID_MARKETPLACE)"
 log "  14 - GET /order* (marketplace=tiktok)                → TikTok Orders (List + Detail)"
 log "  15 - GET /order* (marketplace=shopee)                → Shopee Orders (List + Detail)"
+log "  16 - POST /ship* (marketplace=shopee)                → Shopee Ship Order (ship_order)"
+log "  17 - POST /ship* (marketplace=tiktok)                → TikTok Ship Package (ship)"
+log "  17b- POST /ship* (marketplace=all)                   → Ditolak (INVALID_MARKETPLACE)"
+log "  21 - GET|POST /products* (marketplace=lazada)       → Lazada Products (list + detail)"
+log "  22 - POST /update-stock* (marketplace=lazada)       → Lazada EditChoiceSkuStock"
+log "  23 - GET /order* (marketplace=lazada)               → Lazada Orders (list + items)"
+log "  24 - POST /update-status* (marketplace=lazada)      → Ditolak (ENDPOINT_NOT_SUPPORTED)"
 log "  20 - GET|PUT /config*                                → Config Center (Web UI)"
 log ""
 log "Catatan: Inventory Search TikTok sudah digabung ke endpoint /products:"
@@ -474,4 +632,8 @@ log "  - GET|POST /products               → Product List / Search"
 log "  - GET /products/{id}               → Product Detail"
 log "  - POST /products/create            → Create Product (Shopee & TikTok)"
 log "  - POST /products (with sku_ids)    → TikTok Inventory Search"
+log ""
+log "Sub-endpoints di /ship-order (atau /ship, /ship-package):"
+log "  - POST /ship-order                 → Ship Order / Package (body order_sn / package_id)"
+log "  - POST /ship-order/{id}            → Ship Order / Package (id in URL path)"
 
